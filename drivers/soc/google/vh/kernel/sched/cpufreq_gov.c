@@ -1680,8 +1680,8 @@ static int sugov_kthread_create(struct sugov_policy *sg_policy)
 	if (cpumask_first(policy->related_cpus) < pixel_cluster_start_cpu[1])
 		kthread_bind_mask(thread, policy->related_cpus);
 	else
-		kthread_bind_mask(thread, cpu_possible_mask);
-
+		if (!policy->dvfs_possible_from_any_cpu)
+			kthread_bind_mask(thread, cpu_possible_mask);
 	init_irq_work(&sg_policy->irq_work, sugov_irq_work);
 	mutex_init(&sg_policy->work_lock);
 
