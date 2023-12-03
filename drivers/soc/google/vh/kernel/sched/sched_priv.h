@@ -464,7 +464,6 @@ static inline void init_vendor_task_struct(struct vendor_task_struct *v_tsk)
 	v_tsk->runnable_start_ns = -1;
 }
 
-int acpu_init(void);
 extern struct proc_dir_entry *vendor_sched;
 
 extern u64 sched_slice(struct cfs_rq *cfs_rq, struct sched_entity *se);
