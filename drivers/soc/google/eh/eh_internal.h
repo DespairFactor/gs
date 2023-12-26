@@ -12,7 +12,6 @@
 #include "eh_regs.h"
 #include <linux/spinlock_types.h>
 #include <linux/wait.h>
-#include <linux/kobject.h>
 
 struct eh_completion {
 	void *priv;
@@ -41,7 +40,6 @@ struct eh_sw_fifo {
 };
 
 struct eh_device {
-	struct kobject kobj;
 	struct list_head eh_dev_list;
 
 	/* hardware characteristics */
@@ -107,10 +105,6 @@ struct eh_device {
 
 	eh_cb_fn comp_callback;
 
-	/* how many compression request were processed */
-	unsigned long nr_compressed;
-	/* how many times the EH thread was running */
-	unsigned long nr_run;
 
 	/*
 	 * eh_request pool to avoid memory allocation when EH's HW queue
