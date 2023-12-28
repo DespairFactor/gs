@@ -32,7 +32,6 @@
 		pinctrl-0 = <&fp_irq &fp_rst>;
 		interrupt-parent = <&gpa7>;
 		interrupts = <3 0>;
-		spi-max-frequency = <1000000>;
 		pinctrl-names = "default";
 		fp-gpio-irq = <&gpa7 3 GPIO_ACTIVE_HIGH>;
 		fp-gpio-reset = <&gpp1 0 GPIO_ACTIVE_LOW>;
