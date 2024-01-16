@@ -114,7 +114,7 @@ static LIST_HEAD(eh_dev_list);
 static DEFINE_SPINLOCK(eh_dev_list_lock);
 
 static DECLARE_WAIT_QUEUE_HEAD(eh_compress_wait);
-static unsigned int eh_default_fifo_size = 512;
+static unsigned int eh_default_fifo_size = 4096;
 
 #define EH_SW_FIFO_SIZE	(1 << 16)
 
