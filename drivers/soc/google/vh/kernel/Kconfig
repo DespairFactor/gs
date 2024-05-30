@@ -18,7 +18,7 @@ config VH_SYSTRACE
 config PIXEL_EM
 	tristate "Enable Pixel Energy Model driver"
 	depends on VH_KERNEL
-	default m
+	default n
 	help
 	  Support Pixel Energy Model.
 

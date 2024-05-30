@@ -1211,6 +1211,7 @@ static unsigned long cpu_util_next(int cpu, struct task_struct *p, int dst_cpu)
 #endif
 }
 
+#if IS_ENABLED(CONFIG_PIXEL_EM)
 static inline unsigned long get_idle_cost(int cpu, int opp_level)
 {
 	if (vendor_sched_pixel_idle_em)
@@ -1218,12 +1219,16 @@ static inline unsigned long get_idle_cost(int cpu, int opp_level)
 	else
 		return 0;
 }
+#endif
 
 static inline unsigned long em_cpu_energy_pixel_mod(struct em_perf_domain *pd,
 				unsigned long max_util, unsigned long sum_util, bool count_idle,
 				int dst_cpu)
 {
-	unsigned long freq, scale_cpu, cost;
+	unsigned long freq, scale_cpu;
+#if IS_ENABLED(CONFIG_PIXEL_EM)
+    unsigned long cost;
+#endif
 	struct em_perf_state *ps;
 	int i, cpu;
 
