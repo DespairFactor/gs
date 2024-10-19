@@ -587,7 +587,6 @@ static unsigned int get_next_freq(struct sugov_policy *sg_policy,
 {
 	struct cpufreq_policy *policy = sg_policy->policy;
 	unsigned int freq = policy->cpuinfo.max_freq;
-    unsigned int idx, l_freq, h_freq;
 
 	freq = map_util_freq_pixel_mod(util, freq, max, policy->cpu);
 	trace_sugov_next_freq(policy->cpu, util, max, freq);
@@ -598,21 +597,12 @@ static unsigned int get_next_freq(struct sugov_policy *sg_policy,
 	sg_policy->prev_cached_raw_freq = sg_policy->cached_raw_freq;
 	sg_policy->cached_raw_freq = freq;
 
-	l_freq = cpufreq_driver_resolve_freq(policy, freq);
-	idx = cpufreq_frequency_table_target(policy, freq, CPUFREQ_RELATION_H);
-	h_freq = policy->freq_table[idx].frequency;
-	h_freq = clamp(h_freq, policy->min, policy->max);
-	if (l_freq <= h_freq || l_freq == policy->min)
-		return l_freq;
+	freq = cpufreq_driver_resolve_freq(policy, freq);
 
-	/*
-	 * Use the frequency step below if the calculated frequency is <20%
-	 * higher than it.
-	 */
-	if (mult_frac(100, freq - h_freq, l_freq - h_freq) < 20)
-		return h_freq;
+	/* Workaround a bug in GKI where we can escape policy limits */
+	freq = clamp_val(freq, policy->min, policy->max);
 
-	return l_freq;
+	return freq;
 }
 
 /*
