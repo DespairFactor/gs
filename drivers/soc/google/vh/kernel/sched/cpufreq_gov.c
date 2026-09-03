@@ -334,37 +334,61 @@ static inline void sugov_update_response_time_mult(struct sugov_policy *sg_polic
 unsigned long __always_inline
 apply_dvfs_headroom(unsigned long util, int cpu, bool tapered)
 {
+    unsigned long new_util = util;
+    unsigned long capacity = arch_scale_cpu_capacity(cpu);
+    
+    /* 
+     * PRIME CORE IDENTIFICATION
+     * The prime core is the last CPU in the mask, 
+     * provided the second-to-last CPU doesn't share its maximum capacity.
+     */
+    bool is_prime = (cpu == nr_cpu_ids - 1 &&
+                          arch_scale_cpu_capacity(nr_cpu_ids - 2) != SCHED_CAPACITY_SCALE);
 
-	if (static_branch_likely(&auto_dvfs_headroom_enable)) {
-		u64 limit = per_cpu(dvfs_update_delay, cpu);
+    if (static_branch_likely(&auto_dvfs_headroom_enable)) {
+        u64 limit = per_cpu(dvfs_update_delay, cpu);
 
-		/*
-		 * Only apply a small headroom until the next freq request can
-		 * be taken.
-		 */
-		return approximate_util_avg(util, limit);
-	}
+        /*
+         * PRIME CORE IDLE WAKEUP PROTECTION:
+         * If this is the prime core and the base utilization is trivial 
+         * (under 10% / 100 capacity), bypass the aggressive auto-headroom 
+         * projection entirely.
+         */
+        if (is_prime && util < (SCHED_CAPACITY_SCALE / 10)) {
+            return util;
+        }
 
-	if (tapered && static_branch_unlikely(&tapered_dvfs_headroom_enable)) {
-		unsigned long capacity = arch_scale_cpu_capacity(cpu);
-		unsigned long headroom;
+        new_util = approximate_util_avg(util, limit);
+    }
+    else if (tapered && static_branch_unlikely(&tapered_dvfs_headroom_enable)) {
+        unsigned long headroom;
 
-		if (util >= capacity)
-			return util;
+        if (util >= capacity)
+            return util;
 
-		/*
-		 * Taper the boosting at e top end as these are expensive and
-		 * we don't need that much of a big headroom as we approach max
-		 * capacity
-		 *
-		 */
-		headroom = (capacity - util);
-		/* formula: headroom * (1.X - 1) == headroom * 0.X */
-		headroom = headroom * (sched_dvfs_headroom[cpu] - SCHED_CAPACITY_SCALE) >> SCHED_CAPACITY_SHIFT;
-		return util + headroom;
-	}
+        headroom = (capacity - util);
+        /* formula: headroom * (1.X - 1) == headroom * 0.X */
+        headroom = headroom * (sched_dvfs_headroom[cpu] - SCHED_CAPACITY_SCALE) >> SCHED_CAPACITY_SHIFT;
+        new_util = util + headroom;
+    }
+    else {
+        new_util = util * sched_dvfs_headroom[cpu] >> SCHED_CAPACITY_SHIFT;
+    }
 
-	return util * sched_dvfs_headroom[cpu] >> SCHED_CAPACITY_SHIFT;
+    /* 
+     * PRIME CORE HEADROOM CLAMP
+     * If the task was heavy enough to warrant a headroom projection, strictly 
+     * cap the artificial bump to a maximum of 50% of the prime core's capacity.
+     */
+    if (is_prime && new_util > util) {
+        unsigned long max_headroom = capacity / 2;
+        
+        if ((new_util - util) > max_headroom) {
+            new_util = util + max_headroom;
+        }
+    }
+
+    return new_util;
 }
 
 /*
