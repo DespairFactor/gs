@@ -1,0 +1,71 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+##
+# Platform-specific glue layers go here
+# NOTICE: Make sure your glue layer doesn't depend on anything
+# which is arch-specific and that it compiles on all situations.
+# We want to keep this requirement in order to be able to compile
+# the entire driver (with all its glue layers) on several architectures
+# and make sure it compiles fine. This will also help with allmodconfig
+# and allyesconfig builds.
+##
+# This gives the drivers access to the logbuffer.h and gvotable.h header
+
+load("//build/kernel/kleaf:kernel.bzl", "ddk_module")
+
+package(
+    default_visibility = [
+        "//private/devices/google:__subpackages__",
+        "//private/google-modules/soc/gs:__subpackages__",
+    ],
+)
+
+filegroup(
+    name = "kconfig",
+    srcs = [
+        "Kconfig",
+    ],
+    visibility = [
+        "//private/devices/google:__subpackages__",
+    ],
+)
+
+ddk_module(
+    name = "dwc3-exynos-usb",
+    srcs = glob([
+        "**/*.h",
+    ]),
+    out = "dwc3-exynos-usb.ko",
+    conditional_srcs = {
+        "CONFIG_USB_DWC3_EXYNOS_GS": {
+            True: [
+                "dwc3-exynos-otg.c",
+                "dwc3-exynos.c",
+            ],
+        },
+    },
+    kernel_build = "//private/devices/google/common:kernel",
+    visibility = [
+        "//private/devices/google:__subpackages__",
+        "//private/google-modules/display/samsung:__subpackages__",
+        "//private/google-modules/soc/gs:__subpackages__",
+    ],
+    deps = [
+        "//common:all_headers_aarch64",
+        "//private/google-modules/bms/misc:bms-misc",
+        "//private/google-modules/bms/misc:headers",
+        "//private/google-modules/soc/gs:headers",
+        "//private/google-modules/soc/gs/drivers/soc/google:exynos-cpupm",
+        "//private/google-modules/soc/gs/drivers/soc/google:exynos-pd_hsi0",
+        "//private/google-modules/soc/gs/drivers/soc/google:exynos_pm_qos",
+    ] + select({
+        "//private/devices/google/common:soc_is_zuma_or_zumapro": [
+            "//private/google-modules/soc/gs/drivers/phy/samsung:phy-exynos-usbdrd-eusb-super",
+        ],
+        "//private/devices/google/common:soc_is_gs201_or_before": [
+            "//private/google-modules/soc/gs/drivers/phy/samsung:phy-exynos-usbdrd-super",
+        ],
+        "//conditions:default": [
+        ],
+    }),
+)

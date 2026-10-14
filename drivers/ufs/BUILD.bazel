@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+load("@kleaf//build/kernel/kleaf:kernel.bzl", "kernel_module")
+
+filegroup(
+    name = "kconfig",
+    srcs = [
+        "Kconfig",
+    ],
+    visibility = [
+        "//private/devices/google:__subpackages__",
+    ],
+)
+
+kernel_module(
+    name = "ufs",
+    srcs = glob([
+        "**/*.c",
+        "**/*.h",
+        "**/*.S",
+    ]) + [
+        "Kbuild",
+        "Makefile",
+        "Makefile.preinstall",
+        "//private/google-modules/soc/gs:headers",
+    ],
+    outs = [
+        # keep sorted
+        "ufs-exynos-gs.ko",
+        "ufs-pixel-fips140.ko",
+    ],
+    kernel_build = "//private/devices/google/common:kernel",
+    visibility = [
+        # keep sorted
+        "//private/devices/google:__subpackages__",
+        "//private/google-modules:__subpackages__",
+    ],
+    deps = [
+        "//private/google-modules/soc/gs/drivers/misc/sbb-mux",
+        "//private/google-modules/soc/gs/drivers/soc/google:exynos-cpupm",
+        "//private/google-modules/soc/gs/drivers/soc/google:exynos-pmu-if",
+        "//private/google-modules/soc/gs/drivers/soc/google:exynos_pm_qos",
+        "//private/google-modules/soc/gs/drivers/soc/google/gsa:gsa_ko",
+    ],
+)

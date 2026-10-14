@@ -1,0 +1,4 @@
+# OWNERS-FIX-ORIGINAL: file:kernel-pixel/private/google-modules/perf:/thermal/OWNERS
+file:pixel/kernel-pixel/private/google-modules/perf:/thermal/OWNERS
+# OWNERS-FIX-ORIGINAL: file:kernel-pixel/manifest:/OWNERS_pixel_codebase
+file:pixel/kernel-pixel/manifest:/OWNERS_pixel_codebase

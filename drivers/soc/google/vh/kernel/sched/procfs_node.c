@@ -1,0 +1,4102 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* sysfs_node.c
+ *
+ * Android Vendor Hook Support
+ *
+ * Copyright 2020 Google LLC
+ */
+#include <linux/cpuidle.h>
+#include <linux/cpumask.h>
+#include <linux/cpuset.h>
+#include <linux/lockdep.h>
+#include <linux/kobject.h>
+#include <linux/sched.h>
+#include <linux/sched/cputime.h>
+#include <linux/sched/signal.h>
+#include <linux/sched/task.h>
+#include <linux/proc_fs.h>
+#include <linux/uaccess.h>
+#include <linux/cred.h>
+#include <linux/module.h>
+#include <net/genetlink.h>
+#include <linux/workqueue.h>
+#include <kernel/sched/sched.h>
+#include <trace/events/power.h>
+
+#include "sched_priv.h"
+
+#if IS_ENABLED(CONFIG_UCLAMP_STATS)
+DECLARE_PER_CPU(struct uclamp_stats, uclamp_stats);
+#endif
+
+unsigned int __read_mostly vendor_sched_util_post_init_scale = DEF_UTIL_POST_INIT_SCALE;
+bool __read_mostly vendor_sched_npi_packing = true; //non prefer idle packing
+bool __read_mostly vendor_sched_reduce_prefer_idle = true;
+bool __read_mostly vendor_sched_auto_prefer_idle = false;
+unsigned int __read_mostly vendor_sched_adpf_rampup_multiplier = 1;
+struct cpumask cpu_skip_mask_rt;
+struct cpumask skip_prefer_prev_mask;
+unsigned int __read_mostly vendor_sched_priority_task_boost_value = 0;
+unsigned long __read_mostly vendor_sched_boost_at_fork_duration;
+int vendor_sched_task_placement_retry_count = 3;
+int vendor_sched_task_placement_retry_delay_us = 10;
+
+static struct proc_dir_entry *vendor_sched;
+struct proc_dir_entry *group_dirs[VG_MAX];
+extern struct vendor_group_list vendor_group_list[VG_MAX];
+
+#if IS_ENABLED(CONFIG_RVH_SCHED_LIB)
+static unsigned long sched_lib_mask_in_val;
+static unsigned long sched_lib_mask_out_val;
+#endif
+
+
+#if IS_ENABLED(CONFIG_USE_VENDOR_GROUP_UTIL)
+int __read_mostly vendor_sched_ug_bg_auto_prio = THREAD_PRIORITY_BACKGROUND;
+#endif
+
+static void apply_uclamp_change(enum vendor_group group, enum uclamp_id clamp_id);
+
+struct uclamp_se uclamp_default[UCLAMP_CNT];
+unsigned int pmu_poll_time_ms = 10;
+bool pmu_poll_enabled;
+
+static DEFINE_MUTEX(task_prio_lock);
+
+extern unsigned int sysctl_sched_uclamp_min_filter_us;
+extern unsigned int sysctl_sched_uclamp_max_filter_divider;
+
+extern char priority_task_name[LIB_PATH_LENGTH];
+extern spinlock_t priority_task_name_lock;
+
+extern char prefer_idle_task_name[LIB_PATH_LENGTH];
+extern spinlock_t prefer_idle_task_name_lock;
+
+#define MAX_PROC_SIZE 128
+
+const char *GRP_NAME[VG_MAX] = {"sys", "ta", "fg", "cam", "cam_power", "bg", "sys_bg",
+				"nnapi", "rt", "dex2oat", "ota", "sf", "fg_wi"};
+unsigned int sched_group_tracker_rate_limit = 10;
+
+static const unsigned int SCHED_QOS_PROFILES[SCHED_QOS_MAX] = {
+	/* SCHED_QOS_NONE */
+	0,
+	/* SCHED_QOS_POWER_EFFICIENCY */
+	BIT(SCHED_QOS_AUTO_UCLAMP_MAX_BIT),
+	/* SCHED_QOS_SENSITIVE_STANDARD */
+	BIT(SCHED_QOS_ADPF_BIT) | BIT(SCHED_QOS_PREFER_IDLE_BIT) | BIT(SCHED_QOS_PREFER_FIT_BIT),
+	/* SCHED_QOS_SENSITIVE_HIGH */
+	BIT(SCHED_QOS_ADPF_BIT) | BIT(SCHED_QOS_PREFER_IDLE_BIT) | BIT(SCHED_QOS_PREFER_FIT_BIT) |
+	BIT(SCHED_QOS_PREEMPT_WAKEUP_BIT),
+	/* SCHED_QOS_SENSITIVE_EXTREME */
+	BIT(SCHED_QOS_ADPF_BIT) | BIT(SCHED_QOS_PREFER_IDLE_BIT) | BIT(SCHED_QOS_PREFER_FIT_BIT) |
+	BIT(SCHED_QOS_PREEMPT_WAKEUP_BIT) | BIT(SCHED_QOS_BOOST_PRIO_BIT) };
+
+enum vendor_procfs_type {
+	DEFAULT_TYPE = 0,
+	GROUPED_CONTROL,
+	SCHED_QOS_CONTROL,
+};
+
+#define VENDOR_CMDLINE_LEN 256
+#define VENDOR_SCHED_NETLINK_DELAY_MS 50
+
+#define PROC_OPS_RW(__name) \
+		static int __name##_proc_open(\
+			struct inode *inode, struct file *file) \
+		{ \
+			return single_open(file,\
+			__name##_show, pde_data(inode));\
+		} \
+		static const struct proc_ops  __name##_proc_ops = { \
+			.proc_open	=  __name##_proc_open, \
+			.proc_read	= seq_read, \
+			.proc_lseek	= seq_lseek,\
+			.proc_release = single_release,\
+			.proc_write	=  __name##_store,\
+		}
+
+#define PROC_OPS_RO(__name) \
+		static int __name##_proc_open(\
+			struct inode *inode, struct file *file) \
+		{ \
+			return single_open(file,\
+			__name##_show, pde_data(inode));\
+		} \
+		static const struct proc_ops __name##_proc_ops = { \
+			.proc_open	= __name##_proc_open, \
+			.proc_read	= seq_read, \
+			.proc_lseek	= seq_lseek,\
+			.proc_release = single_release,\
+		}
+
+#define PROC_OPS_WO(__name) \
+		static int __name##_proc_open(\
+			struct inode *inode, struct file *file) \
+		{ \
+			return single_open(file,\
+			NULL, NULL);\
+		} \
+		static const struct proc_ops __name##_proc_ops = { \
+			.proc_open	= __name##_proc_open, \
+			.proc_lseek	= seq_lseek,\
+			.proc_release = single_release,\
+			.proc_write	= __name##_store,\
+		}
+
+#define PROC_ENTRY(__name) {__stringify(__name), DEFAULT_TYPE, -1, &__name##_proc_ops}
+
+#define __PROC_GROUP_ENTRY(__name, __group_name, __vg) \
+		{__stringify(__name), GROUPED_CONTROL, __vg, &__group_name##_##__name##_proc_ops}
+
+#define __PROC_SET_GROUP_ENTRY(__name, __group_name, __vg) \
+		{__stringify(__name), GROUPED_CONTROL, __vg, &__name##_##__group_name##_proc_ops}
+
+#define __PROC_GROUP_ENTRIES(__group_name, __vg)	\
+		__PROC_GROUP_ENTRY(prefer_idle, __group_name, __vg),	\
+		__PROC_GROUP_ENTRY(prefer_high_cap, __group_name, __vg),	\
+		__PROC_GROUP_ENTRY(auto_prefer_fit, __group_name, __vg),	\
+		__PROC_GROUP_ENTRY(group_cfs_skip_mask, __group_name, __vg),	\
+		__PROC_GROUP_ENTRY(preferred_idle_mask_low, __group_name, __vg),	\
+		__PROC_GROUP_ENTRY(preferred_idle_mask_mid, __group_name, __vg),	\
+		__PROC_GROUP_ENTRY(preferred_idle_mask_high, __group_name, __vg),	\
+		__PROC_GROUP_ENTRY(uclamp_min, __group_name, __vg),	\
+		__PROC_GROUP_ENTRY(uclamp_min_on_nice_enable, __group_name, __vg),	\
+		__PROC_GROUP_ENTRY(uclamp_min_on_nice_low_value, __group_name, __vg),	\
+		__PROC_GROUP_ENTRY(uclamp_min_on_nice_mid_value, __group_name, __vg),	\
+		__PROC_GROUP_ENTRY(uclamp_min_on_nice_high_value, __group_name, __vg),	\
+		__PROC_GROUP_ENTRY(uclamp_min_on_nice_low_prio, __group_name, __vg),	\
+		__PROC_GROUP_ENTRY(uclamp_min_on_nice_mid_prio, __group_name, __vg),	\
+		__PROC_GROUP_ENTRY(uclamp_min_on_nice_high_prio, __group_name, __vg),	\
+		__PROC_GROUP_ENTRY(uclamp_max, __group_name, __vg),	\
+		__PROC_GROUP_ENTRY(uclamp_max_on_nice_enable, __group_name, __vg),	\
+		__PROC_GROUP_ENTRY(uclamp_max_on_nice_low_value, __group_name, __vg),	\
+		__PROC_GROUP_ENTRY(uclamp_max_on_nice_mid_value, __group_name, __vg),	\
+		__PROC_GROUP_ENTRY(uclamp_max_on_nice_high_value, __group_name, __vg),	\
+		__PROC_GROUP_ENTRY(uclamp_max_on_nice_low_prio, __group_name, __vg),	\
+		__PROC_GROUP_ENTRY(uclamp_max_on_nice_mid_prio, __group_name, __vg),	\
+		__PROC_GROUP_ENTRY(uclamp_max_on_nice_high_prio, __group_name, __vg),	\
+		__PROC_GROUP_ENTRY(rampup_multiplier, __group_name, __vg),	\
+		__PROC_GROUP_ENTRY(qos_adpf_enable, __group_name, __vg),	\
+		__PROC_GROUP_ENTRY(qos_prefer_idle_enable, __group_name, __vg),	\
+		__PROC_GROUP_ENTRY(qos_prefer_fit_enable, __group_name, __vg),	\
+		__PROC_GROUP_ENTRY(qos_boost_prio_enable, __group_name, __vg),	\
+		__PROC_GROUP_ENTRY(qos_preempt_wakeup_enable, __group_name, __vg),	\
+		__PROC_GROUP_ENTRY(qos_auto_uclamp_max_enable, __group_name, __vg),	\
+		__PROC_GROUP_ENTRY(qos_prefer_high_cap_enable, __group_name, __vg),	\
+		__PROC_GROUP_ENTRY(qos_rampup_multiplier_enable, __group_name, __vg),	\
+		__PROC_GROUP_ENTRY(qos_tag_nice_enable, __group_name, __vg),	\
+		__PROC_GROUP_ENTRY(disable_sched_setaffinity, __group_name, __vg),	\
+		__PROC_GROUP_ENTRY(disable_sched_setaffinity_mask, __group_name, __vg),	\
+		__PROC_GROUP_ENTRY(use_batch_policy, __group_name, __vg),		\
+		__PROC_SET_GROUP_ENTRY(set_task_group, __group_name, __vg),	\
+		__PROC_SET_GROUP_ENTRY(set_proc_group, __group_name, __vg)
+
+#if IS_ENABLED(CONFIG_USE_VENDOR_GROUP_UTIL)
+#define PROC_GROUP_ENTRIES(__group_name, __vg)	\
+		__PROC_GROUP_ENTRIES(__group_name, __vg),	\
+		__PROC_GROUP_ENTRY(ug, __group_name, __vg)
+#else
+#define PROC_GROUP_ENTRIES(__group_name, __vg)	\
+		__PROC_GROUP_ENTRIES(__group_name, __vg),	\
+		__PROC_GROUP_ENTRY(group_throttle, __group_name, __vg)
+#endif
+
+#define PROC_SCHED_QOS_ENTRY(__name)	\
+		 {__stringify(__name), SCHED_QOS_CONTROL, -1, &__name##_proc_ops}
+
+#define SET_VENDOR_GROUP_STORE(__grp, __vg)						      \
+		static ssize_t set_task_group_##__grp##_store(struct file *filp, \
+			const char __user *ubuf, \
+			size_t count, loff_t *pos) \
+		{									      \
+			char buf[MAX_PROC_SIZE];	\
+			int ret;   \
+			if (count >= sizeof(buf))	\
+				return -EINVAL;	\
+			if (copy_from_user(buf, ubuf, count))	\
+				return -EFAULT;	\
+			buf[count] = '\0';	\
+			ret = update_vendor_group(buf, VTA_TASK_GROUP, __vg);   \
+			return ret ?: count;						      \
+		}									      \
+		PROC_OPS_WO(set_task_group_##__grp);		\
+		static ssize_t set_proc_group_##__grp##_store(struct file *filp, \
+			const char __user *ubuf, \
+			size_t count, loff_t *pos)		\
+		{									      \
+			char buf[MAX_PROC_SIZE];	\
+			int ret;   \
+			if (count >= sizeof(buf))	\
+				return -EINVAL;	\
+			if (copy_from_user(buf, ubuf, count))	\
+				return -EFAULT;	\
+			buf[count] = '\0';	\
+			ret = update_vendor_group(buf, VTA_PROC_GROUP, __vg);   \
+			return ret ?: count;						      \
+		}									      \
+		PROC_OPS_WO(set_proc_group_##__grp);
+
+#define VENDOR_GROUP_BOOL_ATTRIBUTE(__grp, __attr, __vg)				      \
+		static int __grp##_##__attr##_show(struct seq_file *m, void *v) 	\
+		{									      \
+			struct vendor_group_property *gp = get_vendor_group_property(__vg);   \
+			seq_printf(m, "%s\n", gp->__attr==true? "true":"false"); \
+			return 0; 	\
+		}									      \
+		static ssize_t __grp##_##__attr##_store(struct file *filp, \
+			const char __user *ubuf, \
+			size_t count, loff_t *pos) \
+		{									      \
+			bool val;							      \
+			struct vendor_group_property *gp = get_vendor_group_property(__vg);   \
+			char buf[MAX_PROC_SIZE];	\
+			if (count >= sizeof(buf))	\
+				return -EINVAL;	\
+			if (copy_from_user(buf, ubuf, count))	\
+				return -EFAULT;	\
+			buf[count] = '\0';	\
+			if (kstrtobool(buf, &val))					      \
+				return -EINVAL;						      \
+			gp->__attr = val;						      \
+			return count;							      \
+		}									      \
+		PROC_OPS_RW(__grp##_##__attr);
+
+#define VENDOR_GROUP_UINT_ATTRIBUTE_CHECK(__grp, __attr, __vg, __check_func)		      \
+		static int __grp##_##__attr##_show(struct seq_file *m, void *v) 	      \
+		{									      \
+			struct vendor_group_property *gp = get_vendor_group_property(__vg);   \
+			seq_printf(m, "%u\n", gp->__attr);	      \
+			return 0;	      \
+		}									      \
+		static ssize_t __grp##_##__attr##_store(struct file *filp,		      \
+			const char __user *ubuf, \
+			size_t count, loff_t *pos) \
+		{									      \
+			unsigned int val, old_val;					      \
+			bool (*check_func)(enum vendor_group group) = __check_func;	      \
+			struct vendor_group_property *gp = get_vendor_group_property(__vg);   \
+			char buf[MAX_PROC_SIZE];	\
+			if (count >= sizeof(buf))	\
+				return -EINVAL;	\
+			if (copy_from_user(buf, ubuf, count))	\
+				return -EFAULT;	\
+			buf[count] = '\0';	\
+			if (kstrtouint(buf, 10, &val))					      \
+				return -EINVAL;						      \
+			old_val = gp->__attr;					      \
+			gp->__attr = val;						      \
+			if (check_func && !check_func(__vg)) {				      \
+				gp->__attr = old_val;					      \
+				return -EINVAL;						      \
+			}								      \
+			return count;							      \
+		}									      \
+		PROC_OPS_RW(__grp##_##__attr);
+
+#define VENDOR_GROUP_UINT_ATTRIBUTE(__grp, __attr, __vg)				      \
+		VENDOR_GROUP_UINT_ATTRIBUTE_CHECK(__grp, __attr, __vg, NULL)
+
+#define VENDOR_GROUP_CPUMASK_ATTRIBUTE(__grp, __attr, __vg)				      \
+		static int __grp##_##__attr##_show(struct seq_file *m, void *v) 	\
+		{									      \
+			struct vendor_group_property *gp = get_vendor_group_property(__vg);   \
+			seq_printf(m, "0x%lx\n", *gp->__attr.bits);	      \
+			return 0;	      \
+		}									      \
+		static ssize_t __grp##_##__attr##_store(struct file *filp,			\
+			const char __user *ubuf, \
+			size_t count, loff_t *pos) \
+		{									      \
+			unsigned long val;					              \
+			struct vendor_group_property *gp = get_vendor_group_property(__vg);   \
+			char buf[MAX_PROC_SIZE];	\
+			if (count >= sizeof(buf))	\
+				return -EINVAL;	\
+			if (copy_from_user(buf, ubuf, count))	\
+				return -EFAULT;	\
+			buf[count] = '\0';	\
+			if (kstrtoul(buf, 0, &val))					      \
+				return -EINVAL;						      \
+			*gp->__attr.bits = val;						      \
+			return count;							      \
+		}									      \
+		PROC_OPS_RW(__grp##_##__attr);
+
+#define VENDOR_GROUP_UCLAMP_ATTRIBUTE(__grp, __attr, __vg, __cid)			      \
+		static int __grp##_##__attr##_show(struct seq_file *m, void *v) 	\
+		{									      \
+			struct vendor_group_property *gp = get_vendor_group_property(__vg);   \
+			seq_printf(m, "%d\n", gp->uc_req[__cid].value);		      \
+			return 0;	\
+		}									      \
+		static ssize_t __grp##_##__attr##_store(struct file *filp,			\
+			const char __user *ubuf, \
+			size_t count, loff_t *pos) \
+		{									      \
+			unsigned int val;						      \
+			struct vendor_group_property *gp = get_vendor_group_property(__vg);   \
+			char buf[MAX_PROC_SIZE];	\
+			if (count >= sizeof(buf))	\
+				return -EINVAL;	\
+			if (copy_from_user(buf, ubuf, count))	\
+				return -EFAULT;	\
+			buf[count] = '\0';	\
+			if (kstrtoint(buf, 0, &val))					      \
+				return -EINVAL;						      \
+			if (val > 1024 && val != AUTO_UCLAMP_MAX_MAGIC)			      \
+				return -EINVAL;						      \
+			if (val == gp->uc_req[__cid].value && (__cid != UCLAMP_MAX ||	      \
+			    !gp->auto_uclamp_max))					      \
+				return count;						      \
+			if (__cid == UCLAMP_MAX) {					      \
+				if (val == AUTO_UCLAMP_MAX_MAGIC) {			      \
+					gp->auto_uclamp_max = true;			      \
+					val = uclamp_none(UCLAMP_MAX);			      \
+				} else {						      \
+					gp->auto_uclamp_max = false;			      \
+				}							      \
+			}								      \
+			gp->uc_req[__cid].value = val;					      \
+			gp->uc_req[__cid].bucket_id = get_bucket_id(val);		      \
+			gp->uc_req[__cid].user_defined = false;				      \
+			apply_uclamp_change(__vg, __cid);				      \
+			return count;							      \
+		}									      \
+		PROC_OPS_RW(__grp##_##__attr);
+
+#define PER_TASK_BOOL_ATTRIBUTE(__attr)						      \
+		static ssize_t __attr##_set##_store(struct file *filp, \
+			const char __user *ubuf, \
+			size_t count, loff_t *pos) \
+		{									      \
+			char buf[MAX_PROC_SIZE];	\
+			int ret;	\
+			if (count >= sizeof(buf))	\
+				return -EINVAL;	\
+			if (copy_from_user(buf, ubuf, count))	\
+				return -EFAULT;	\
+			buf[count] = '\0';	\
+			ret = update_##__attr(buf, true);   \
+			return ret ?: count;						      \
+		}									      \
+		PROC_OPS_WO(__attr##_set);	\
+		static ssize_t __attr##_clear##_store(struct file *filp, \
+			const char __user *ubuf, \
+			size_t count, loff_t *pos) \
+		{									      \
+			char buf[MAX_PROC_SIZE];	\
+			int ret;	\
+			if (count >= sizeof(buf))	\
+				return -EINVAL;	\
+			if (copy_from_user(buf, ubuf, count))	\
+				return -EFAULT;	\
+			buf[count] = '\0';	\
+			ret = update_##__attr(buf, false);   \
+			return ret ?: count;						      \
+		}									      \
+		PROC_OPS_WO(__attr##_clear);
+
+#define PER_TASK_UINT_ATTRIBUTE(__attr)						      \
+		static ssize_t __attr##_store(struct file *filp, \
+			const char __user *ubuf, \
+			size_t count, loff_t *pos) \
+		{									      \
+			char buf[MAX_PROC_SIZE];	\
+			int ret;	\
+			if (count >= sizeof(buf))	\
+				return -EINVAL;	\
+			if (copy_from_user(buf, ubuf, count))	\
+				return -EFAULT;	\
+			buf[count] = '\0';	\
+			ret = update_##__attr(buf, count);   \
+			return ret ?: count;						      \
+		}									      \
+		PROC_OPS_WO(__attr);
+
+#if IS_ENABLED(CONFIG_USE_VENDOR_GROUP_UTIL)
+#define UTILIZATION_GROUP_UINT_ATTRIBUTE(__grp, __attr, __ug)				      \
+		static int __grp##_##__attr##_show(struct seq_file *m, void *v) 	\
+		{									      \
+			struct vendor_util_group_property *gp = \
+				get_vendor_util_group_property(__ug);   \
+			seq_printf(m, "%u\n", gp->__attr);	      \
+			return 0;	      \
+		}									      \
+		static ssize_t __grp##_##__attr##_store(struct file *filp,			\
+			const char __user *ubuf, \
+			size_t count, loff_t *pos) \
+		{									      \
+			unsigned int val;					              \
+			struct vendor_util_group_property *gp = \
+				get_vendor_util_group_property(__ug);   \
+			char buf[MAX_PROC_SIZE];	\
+			if (count >= sizeof(buf))	\
+				return -EINVAL;	\
+			if (copy_from_user(buf, ubuf, count))	\
+				return -EFAULT;	\
+			buf[count] = '\0';	\
+			if (kstrtouint(buf, 10, &val))					      \
+				return -EINVAL;						      \
+			gp->__attr = val;						      \
+			return count;							      \
+		}									      \
+		PROC_OPS_RW(__grp##_##__attr);
+
+
+#define UTILIZATION_GROUP_UCLAMP_ATTRIBUTE(__grp, __attr, __ug, __cid)			      \
+		static int __grp##_##__attr##_show(struct seq_file *m, void *v) 	\
+		{									      \
+			struct vendor_util_group_property *gp = \
+				get_vendor_util_group_property(__ug);   \
+			seq_printf(m, "%u\n", gp->uc_req[__cid].value);		      \
+			return 0;	\
+		}									      \
+		static ssize_t __grp##_##__attr##_store(struct file *filp,			\
+			const char __user *ubuf, \
+			size_t count, loff_t *pos) \
+		{									      \
+			unsigned int val;						      \
+			struct vendor_util_group_property *gp = \
+				get_vendor_util_group_property(__ug);   \
+			char buf[MAX_PROC_SIZE];	\
+			if (count >= sizeof(buf))	\
+				return -EINVAL;	\
+			if (copy_from_user(buf, ubuf, count))	\
+				return -EFAULT;	\
+			buf[count] = '\0';	\
+			if (kstrtouint(buf, 0, &val))					      \
+				return -EINVAL;						      \
+			if (val > 1024)							      \
+				return -EINVAL;						      \
+			gp->uc_req[__cid].value = val;					      \
+			return count;							      \
+		}									      \
+		PROC_OPS_RW(__grp##_##__attr);
+#endif
+
+#define UCLAMP_ON_NICE_PRIO_CHECK_FUN(__uclamp_id) \
+static inline bool check_uclamp_##__uclamp_id##_on_nice_prio(enum vendor_group group) \
+{ \
+	if (vg[group].uclamp_##__uclamp_id##_on_nice_mid_prio < \
+		vg[group].uclamp_##__uclamp_id##_on_nice_high_prio) \
+		return false; \
+	if (vg[group].uclamp_##__uclamp_id##_on_nice_low_prio < \
+		vg[group].uclamp_##__uclamp_id##_on_nice_mid_prio) \
+		return false; \
+	if (vg[group].uclamp_##__uclamp_id##_on_nice_low_prio < \
+		vg[group].uclamp_##__uclamp_id##_on_nice_high_prio) \
+		return false; \
+	return true; \
+}
+
+static inline bool check_rampup_multiplier(enum vendor_group group)
+{
+	return true;
+}
+
+static inline bool reset_group_sched_setaffinity(enum vendor_group group);
+static inline bool reset_group_batch_policy(enum vendor_group group);
+
+#if IS_ENABLED(CONFIG_USE_VENDOR_GROUP_UTIL)
+#define CREATE_VENDOR_GROUP_UTIL_ATTRIBUTES(__grp, __vg)				\
+	VENDOR_GROUP_UINT_ATTRIBUTE_CHECK(__grp, ug, __vg, check_ug);
+#else
+#define CREATE_VENDOR_GROUP_UTIL_ATTRIBUTES(__grp, __vg)				\
+	VENDOR_GROUP_UINT_ATTRIBUTE(__grp, group_throttle, __vg);
+#endif
+
+#define CREATE_VENDOR_GROUP_ATTRIBUTES(__grp, __vg)					\
+	VENDOR_GROUP_BOOL_ATTRIBUTE(__grp, prefer_idle, __vg);				\
+	VENDOR_GROUP_BOOL_ATTRIBUTE(__grp, prefer_high_cap, __vg);			\
+	VENDOR_GROUP_BOOL_ATTRIBUTE(__grp, auto_prefer_fit, __vg);			\
+	VENDOR_GROUP_CPUMASK_ATTRIBUTE(__grp, group_cfs_skip_mask, __vg);		\
+	VENDOR_GROUP_CPUMASK_ATTRIBUTE(__grp, preferred_idle_mask_low, __vg);		\
+	VENDOR_GROUP_CPUMASK_ATTRIBUTE(__grp, preferred_idle_mask_mid, __vg);		\
+	VENDOR_GROUP_CPUMASK_ATTRIBUTE(__grp, preferred_idle_mask_high, __vg);		\
+	VENDOR_GROUP_UCLAMP_ATTRIBUTE(__grp, uclamp_min, __vg, UCLAMP_MIN);		\
+	VENDOR_GROUP_UCLAMP_ATTRIBUTE(__grp, uclamp_max, __vg, UCLAMP_MAX);		\
+	VENDOR_GROUP_UINT_ATTRIBUTE(__grp, uclamp_min_on_nice_low_value, __vg);		\
+	VENDOR_GROUP_UINT_ATTRIBUTE(__grp, uclamp_min_on_nice_mid_value, __vg);		\
+	VENDOR_GROUP_UINT_ATTRIBUTE(__grp, uclamp_min_on_nice_high_value, __vg);	\
+	VENDOR_GROUP_UINT_ATTRIBUTE(__grp, uclamp_max_on_nice_low_value, __vg);		\
+	VENDOR_GROUP_UINT_ATTRIBUTE(__grp, uclamp_max_on_nice_mid_value, __vg);		\
+	VENDOR_GROUP_UINT_ATTRIBUTE(__grp, uclamp_max_on_nice_high_value, __vg);	\
+	VENDOR_GROUP_UINT_ATTRIBUTE_CHECK(__grp, uclamp_min_on_nice_low_prio, __vg,	\
+					  check_uclamp_min_on_nice_prio);		\
+	VENDOR_GROUP_UINT_ATTRIBUTE_CHECK(__grp, uclamp_min_on_nice_mid_prio, __vg,	\
+					  check_uclamp_min_on_nice_prio);		\
+	VENDOR_GROUP_UINT_ATTRIBUTE_CHECK(__grp, uclamp_min_on_nice_high_prio, __vg,	\
+					  check_uclamp_min_on_nice_prio);		\
+	VENDOR_GROUP_UINT_ATTRIBUTE_CHECK(__grp, uclamp_max_on_nice_low_prio, __vg,	\
+					  check_uclamp_max_on_nice_prio);		\
+	VENDOR_GROUP_UINT_ATTRIBUTE_CHECK(__grp, uclamp_max_on_nice_mid_prio, __vg,	\
+					  check_uclamp_max_on_nice_prio);		\
+	VENDOR_GROUP_UINT_ATTRIBUTE_CHECK(__grp, uclamp_max_on_nice_high_prio, __vg,	\
+					  check_uclamp_max_on_nice_prio);		\
+	VENDOR_GROUP_BOOL_ATTRIBUTE(__grp, uclamp_min_on_nice_enable, __vg);		\
+	VENDOR_GROUP_BOOL_ATTRIBUTE(__grp, uclamp_max_on_nice_enable, __vg);		\
+	VENDOR_GROUP_UINT_ATTRIBUTE_CHECK(__grp, rampup_multiplier, __vg,		\
+					  check_rampup_multiplier);			\
+	VENDOR_GROUP_BOOL_ATTRIBUTE(__grp, qos_adpf_enable, __vg);			\
+	VENDOR_GROUP_BOOL_ATTRIBUTE(__grp, qos_prefer_idle_enable, __vg);		\
+	VENDOR_GROUP_BOOL_ATTRIBUTE(__grp, qos_prefer_fit_enable, __vg);		\
+	VENDOR_GROUP_BOOL_ATTRIBUTE(__grp, qos_boost_prio_enable, __vg);		\
+	VENDOR_GROUP_BOOL_ATTRIBUTE(__grp, qos_preempt_wakeup_enable, __vg);		\
+	VENDOR_GROUP_BOOL_ATTRIBUTE(__grp, qos_auto_uclamp_max_enable, __vg);		\
+	VENDOR_GROUP_BOOL_ATTRIBUTE(__grp, qos_prefer_high_cap_enable, __vg);		\
+	VENDOR_GROUP_BOOL_ATTRIBUTE(__grp, qos_rampup_multiplier_enable, __vg);		\
+	VENDOR_GROUP_BOOL_ATTRIBUTE(__grp, qos_tag_nice_enable, __vg);			\
+	VENDOR_GROUP_UINT_ATTRIBUTE_CHECK(__grp, disable_sched_setaffinity, __vg,	\
+					  reset_group_sched_setaffinity);		\
+	VENDOR_GROUP_UINT_ATTRIBUTE_CHECK(__grp, disable_sched_setaffinity_mask, __vg,	\
+					  reset_group_sched_setaffinity);		\
+	VENDOR_GROUP_UINT_ATTRIBUTE_CHECK(__grp, use_batch_policy, __vg,		\
+					  reset_group_batch_policy);			\
+	CREATE_VENDOR_GROUP_UTIL_ATTRIBUTES(__grp, __vg);
+
+/// ******************************************************************************** ///
+/// ********************* Create vendor group procfs nodes*************************** ///
+/// ******************************************************************************** ///
+
+UCLAMP_ON_NICE_PRIO_CHECK_FUN(min);
+UCLAMP_ON_NICE_PRIO_CHECK_FUN(max);
+
+#if IS_ENABLED(CONFIG_USE_VENDOR_GROUP_UTIL)
+static inline bool check_ug(enum vendor_group group)
+{
+	if (vg[group].ug < UG_BG || vg[group].ug > UG_AUTO)
+		return false;
+
+	return true;
+}
+#endif
+
+CREATE_VENDOR_GROUP_ATTRIBUTES(ta, VG_TOPAPP);
+CREATE_VENDOR_GROUP_ATTRIBUTES(fg, VG_FOREGROUND);
+CREATE_VENDOR_GROUP_ATTRIBUTES(sys, VG_SYSTEM);
+CREATE_VENDOR_GROUP_ATTRIBUTES(cam, VG_CAMERA);
+CREATE_VENDOR_GROUP_ATTRIBUTES(cam_power, VG_CAMERA_POWER);
+CREATE_VENDOR_GROUP_ATTRIBUTES(bg, VG_BACKGROUND);
+CREATE_VENDOR_GROUP_ATTRIBUTES(sysbg, VG_SYSTEM_BACKGROUND);
+CREATE_VENDOR_GROUP_ATTRIBUTES(nnapi, VG_NNAPI_HAL);
+CREATE_VENDOR_GROUP_ATTRIBUTES(rt, VG_RT);
+CREATE_VENDOR_GROUP_ATTRIBUTES(dex2oat, VG_DEX2OAT);
+CREATE_VENDOR_GROUP_ATTRIBUTES(ota, VG_OTA);
+CREATE_VENDOR_GROUP_ATTRIBUTES(sf, VG_SF);
+CREATE_VENDOR_GROUP_ATTRIBUTES(fg_wi, VG_FOREGROUND_WINDOW);
+
+#if IS_ENABLED(CONFIG_USE_VENDOR_GROUP_UTIL)
+#if IS_ENABLED(CONFIG_USE_GROUP_THROTTLE)
+UTILIZATION_GROUP_UINT_ATTRIBUTE(ug_fg, group_throttle, UG_FG);
+#endif
+UTILIZATION_GROUP_UCLAMP_ATTRIBUTE(ug_fg, uclamp_min, UG_FG, UCLAMP_MIN);
+UTILIZATION_GROUP_UCLAMP_ATTRIBUTE(ug_fg, uclamp_max, UG_FG, UCLAMP_MAX);
+
+#if IS_ENABLED(CONFIG_USE_GROUP_THROTTLE)
+UTILIZATION_GROUP_UINT_ATTRIBUTE(ug_bg, group_throttle, UG_BG);
+#endif
+UTILIZATION_GROUP_UCLAMP_ATTRIBUTE(ug_bg, uclamp_min, UG_BG, UCLAMP_MIN);
+UTILIZATION_GROUP_UCLAMP_ATTRIBUTE(ug_bg, uclamp_max, UG_BG, UCLAMP_MAX);
+#endif
+
+/// ******************************************************************************** ///
+/// ********************* New code section ***************************************** ///
+/// ******************************************************************************** ///
+static int update_vendor_tunables(const char *buf, int count, int type)
+{
+	char *tok, *str1, *str2;
+	unsigned int val, tmp[CONFIG_VH_SCHED_MAX_CPU_NR];
+	int index = 0;
+	unsigned int *updated_tunables;
+
+	str1 = kstrndup(buf, count, GFP_KERNEL);
+	str2 = str1;
+
+	if (!str2)
+		return -ENOMEM;
+
+	while (1) {
+		tok = strsep(&str2, " ");
+
+		if (tok == NULL)
+			break;
+
+		if (kstrtouint(tok, 0, &val))
+			goto fail;
+
+		switch (type) {
+			case SCHED_CAPACITY_MARGIN:
+				if (val < SCHED_CAPACITY_SCALE)
+					goto fail;
+				updated_tunables = sched_capacity_margin;
+				break;
+			case SCHED_THERMAL_CAP_MARGIN:
+				if (val < SCHED_CAPACITY_SCALE)
+					goto fail;
+				updated_tunables = thermal_cap_margin;
+				break;
+			case SCHED_MAX_UCLAMP_ST:
+				if (val > SCHED_CAPACITY_SCALE)
+					goto fail;
+				updated_tunables =
+					&sched_auto_uclamp_max[SCHED_AUTO_UCLAMP_MAX_ST][0];
+				break;
+			case SCHED_AUTO_UCLAMP_MAX:
+				if (val > SCHED_CAPACITY_SCALE)
+					goto fail;
+				updated_tunables =
+					&sched_auto_uclamp_max[SCHED_AUTO_UCLAMP_MAX_TASK][0];
+				break;
+			case SCHED_DVFS_HEADROOM:
+				if (val > DEF_UTIL_THRESHOLD || val < SCHED_CAPACITY_SCALE)
+					goto fail;
+				updated_tunables = sched_dvfs_headroom;
+				break;
+			case SCHED_IOWAIT_BOOST_MAX:
+				if (val > SCHED_CAPACITY_SCALE)
+					goto fail;
+				updated_tunables = sched_per_cpu_iowait_boost_max_value;
+				break;
+			case SCHED_MEMORY_CAPACITY:
+				if (val > SCHED_CAPACITY_SCALE)
+					goto fail;
+				updated_tunables = sched_memory_capacity;
+				break;
+			default:
+				goto fail;
+		}
+		tmp[index] = val;
+		index++;
+
+		if (index == pixel_cpu_num)
+			break;
+	}
+
+	if (index == 1) {
+		for (index = 0; index < pixel_cpu_num; index++)
+			updated_tunables[index] = tmp[0];
+	} else if (index == pixel_cluster_num) {
+		for (index = 0; index < pixel_cpu_num; index++)
+			updated_tunables[index] = tmp[pixel_cpu_to_cluster[index]];
+	} else if (index == pixel_cpu_num) {
+		memcpy(updated_tunables, tmp, sizeof(tmp));
+	} else {
+		goto fail;
+	}
+
+	kfree(str1);
+	return count;
+fail:
+	kfree(str1);
+	return -EINVAL;
+}
+
+static inline void __reset_task_affinity_mask(struct task_struct *p, const struct cpumask *in_mask)
+{
+#if IS_ENABLED(CONFIG_RVH_SCHED_LIB)
+	struct cpumask out_mask;
+
+	if (!vg[get_vendor_group(p)].disable_sched_setaffinity_mask)
+		return;
+
+	if (!(sched_lib_mask_in_val && sched_lib_mask_out_val))
+		return;
+
+	if (in_mask->bits[0] != sched_lib_mask_in_val)
+		return;
+
+	out_mask.bits[0] = sched_lib_mask_out_val;
+	set_cpus_allowed_ptr(p, &out_mask);
+#endif
+}
+
+inline void __reset_task_affinity(struct task_struct *p, const struct cpumask *in_mask)
+{
+	struct cpumask out_mask;
+
+	if (check_cap(p, CAP_SYS_NICE))
+		return;
+
+	if (p->flags & (PF_WQ_WORKER | PF_IDLE | PF_NO_SETAFFINITY | PF_KTHREAD))
+		return;
+
+	if (in_mask)
+		return __reset_task_affinity_mask(p, in_mask);
+
+	cpuset_cpus_allowed(p, &out_mask);
+	set_cpus_allowed_ptr(p, &out_mask);
+}
+
+/*
+ * Reset cpumask to task's cpuset for all tasks in the system.
+ */
+static inline void reset_sched_setaffinity(void)
+{
+	struct task_struct *p, *t;
+
+	rcu_read_lock();
+	for_each_process_thread(p, t)
+		__reset_task_affinity(t, NULL);
+	rcu_read_unlock();
+}
+
+/*
+ * Reset cpumask to task's cpuset for all tasks in the group.
+ */
+static inline bool reset_group_sched_setaffinity(enum vendor_group group)
+{
+	struct task_struct *p, *t;
+
+	if (!vg[group].disable_sched_setaffinity &&
+	    !vg[group].disable_sched_setaffinity_mask)
+		return true;
+
+	rcu_read_lock();
+	for_each_process_thread(p, t) {
+		const struct cpumask *in_mask = NULL;
+
+		if (get_vendor_group(t) == group) {
+			if (vg[group].disable_sched_setaffinity_mask)
+				in_mask = t->cpus_ptr;
+			__reset_task_affinity(t, in_mask);
+		}
+	}
+	rcu_read_unlock();
+
+	return true;
+}
+
+static inline void set_batch_policy_locked(struct task_struct *p, int group)
+{
+	struct vendor_task_struct *vp;
+
+	if (!fair_policy(p->policy))
+		return;
+
+	vp = get_vendor_task_struct(p);
+	if (vg[group].use_batch_policy)
+		p->policy = SCHED_BATCH;
+	else
+		p->policy = vp->orig_policy;
+}
+
+static inline void set_batch_policy(struct task_struct *p, int group)
+{
+	struct rq_flags rf;
+	struct rq *rq;
+
+	rq = task_rq_lock(p, &rf);
+	set_batch_policy_locked(p, group);
+	task_rq_unlock(rq, p, &rf);
+}
+
+static inline bool reset_group_batch_policy(enum vendor_group group)
+{
+	struct task_struct *p, *t;
+
+	rcu_read_lock();
+	for_each_process_thread(p, t) {
+		if (get_vendor_group(t) == group)
+			set_batch_policy(t, group);
+	}
+	rcu_read_unlock();
+
+	return true;
+}
+
+static inline struct task_struct *get_next_task(int group, struct list_head *head)
+{
+	unsigned long irqflags;
+	struct task_struct *p;
+	struct vendor_task_struct_h *vph;
+	struct list_head *cur;
+
+	raw_spin_lock_irqsave(&vendor_group_list[group].lock, irqflags);
+
+	if (list_empty(head)) {
+		vendor_group_list[group].cur_iterator = NULL;
+		raw_spin_unlock_irqrestore(&vendor_group_list[group].lock, irqflags);
+		return NULL;
+	}
+
+	if (vendor_group_list[group].cur_iterator)
+		cur = vendor_group_list[group].cur_iterator;
+	else
+		cur = head;
+
+	do {
+		if (cur->next == head) {
+			vendor_group_list[group].cur_iterator = NULL;
+			raw_spin_unlock_irqrestore(&vendor_group_list[group].lock, irqflags);
+			return NULL;
+		}
+
+		cur = cur->next;
+		vph = list_entry(cur, struct vendor_task_struct_h, node);
+		p = __container_of(vph, struct task_struct, android_vendor_data1);
+	} while ((!task_on_rq_queued(p) || p->flags & PF_EXITING));
+
+	get_task_struct(p);
+	vendor_group_list[group].cur_iterator = cur;
+
+	raw_spin_unlock_irqrestore(&vendor_group_list[group].lock, irqflags);
+
+	return p;
+}
+
+static void apply_uclamp_change(enum vendor_group group, enum uclamp_id clamp_id)
+{
+	struct vendor_group_list *vgl = &vendor_group_list[group];
+	struct task_struct *p;
+
+	if (trace_clock_set_rate_enabled()) {
+		char trace_name[32] = {0};
+		struct vendor_group_property *gp = get_vendor_group_property(group);
+		scnprintf(trace_name, sizeof(trace_name), "%s_grp_%s",
+			clamp_id  == UCLAMP_MIN ? "UCLAMP_MIN" : "UCLAMP_MAX", GRP_NAME[group]);
+		trace_clock_set_rate(trace_name, gp->uc_req[clamp_id].value,
+				raw_smp_processor_id());
+	}
+
+	mutex_lock(&vgl->iter_mutex);
+	if (WARN_ON(vgl->cur_iterator)) {
+		unsigned long irqflags;
+		raw_spin_lock_irqsave(&vendor_group_list[group].lock, irqflags);
+		vgl->cur_iterator = NULL;
+		raw_spin_unlock_irqrestore(&vendor_group_list[group].lock, irqflags);
+	}
+
+	while ((p = get_next_task(group, &vgl->list))) {
+		uclamp_update_active(p, clamp_id);
+		put_task_struct(p);
+	}
+	mutex_unlock(&vgl->iter_mutex);
+}
+
+static int update_prefer_idle(const char *buf, bool val)
+{
+	struct vendor_task_struct *vp;
+	struct task_struct *p;
+	pid_t pid;
+
+	if (kstrtoint(buf, 0, &pid) || pid <= 0)
+		return -EINVAL;
+
+	rcu_read_lock();
+	p = find_task_by_vpid(pid);
+	if (!p) {
+		rcu_read_unlock();
+		return -ESRCH;
+	}
+
+	get_task_struct(p);
+
+	if (!check_cred(p)) {
+		put_task_struct(p);
+		rcu_read_unlock();
+		return -EACCES;
+	}
+
+	vp = get_vendor_task_struct(p);
+
+	if (val)
+		set_bit(SCHED_QOS_PREFER_IDLE_BIT, &vp->sched_qos_user_defined_flag);
+	else
+		clear_bit(SCHED_QOS_PREFER_IDLE_BIT, &vp->sched_qos_user_defined_flag);
+
+	put_task_struct(p);
+	rcu_read_unlock();
+
+	return 0;
+}
+
+static int update_boost_prio(const char *buf, bool val)
+{
+	struct vendor_task_struct *vp;
+	struct task_struct *p;
+	pid_t pid;
+	struct rq_flags rf;
+	struct rq *rq;
+	bool prev_boost_prio;
+
+	mutex_lock(&task_prio_lock);
+
+	if (kstrtoint(buf, 0, &pid) || pid <= 0) {
+		mutex_unlock(&task_prio_lock);
+		return -EINVAL;
+	}
+
+	rcu_read_lock();
+	p = find_task_by_vpid(pid);
+	if (!p) {
+		rcu_read_unlock();
+		mutex_unlock(&task_prio_lock);
+		return -ESRCH;
+	}
+
+	get_task_struct(p);
+	vp = get_vendor_task_struct(p);
+
+	/* Do not allow to set it if tag_nice is set already. */
+	if ((vp->sched_qos_user_defined_flag & BIT(SCHED_QOS_TAG_NICE_BIT))) {
+		put_task_struct(p);
+		rcu_read_unlock();
+		mutex_unlock(&task_prio_lock);
+		return -EINVAL;
+	}
+
+	if (!check_cred(p)) {
+		put_task_struct(p);
+		rcu_read_unlock();
+		mutex_unlock(&task_prio_lock);
+		return -EACCES;
+	}
+
+	prev_boost_prio = !!(vp->sched_qos_user_defined_flag & BIT(SCHED_QOS_BOOST_PRIO_BIT));
+
+	if (val)
+		set_bit(SCHED_QOS_BOOST_PRIO_BIT, &vp->sched_qos_user_defined_flag);
+	else
+		clear_bit(SCHED_QOS_BOOST_PRIO_BIT, &vp->sched_qos_user_defined_flag);
+
+	if (prev_boost_prio != val) {
+		/* Only boost task prio when both val and group qos_boost_prio_enable are true. */
+		if (val && vg[vp->group].qos_boost_prio_enable) {
+			rq = task_rq_lock(p, &rf);
+			update_task_prio(p, vp, true, NICE_TO_PRIO(MIN_NICE));
+			task_rq_unlock(rq, p, &rf);
+		/* Restore to original value. */
+		} else {
+			rq = task_rq_lock(p, &rf);
+			update_task_prio(p, vp, false, vp->orig_prio);
+			task_rq_unlock(rq, p, &rf);
+		}
+	}
+
+	put_task_struct(p);
+	rcu_read_unlock();
+	mutex_unlock(&task_prio_lock);
+
+	return 0;
+}
+
+static int update_prefer_fit(const char *buf, bool val)
+{
+	struct vendor_task_struct *vp;
+	struct task_struct *p;
+	pid_t pid;
+
+	if (kstrtoint(buf, 0, &pid) || pid <= 0)
+		return -EINVAL;
+
+	rcu_read_lock();
+	p = find_task_by_vpid(pid);
+	if (!p) {
+		rcu_read_unlock();
+		return -ESRCH;
+	}
+
+	get_task_struct(p);
+
+	if (!check_cred(p)) {
+		put_task_struct(p);
+		rcu_read_unlock();
+		return -EACCES;
+	}
+
+	vp = get_vendor_task_struct(p);
+
+	if (val)
+		set_bit(SCHED_QOS_PREFER_FIT_BIT, &vp->sched_qos_user_defined_flag);
+	else
+		clear_bit(SCHED_QOS_PREFER_FIT_BIT, &vp->sched_qos_user_defined_flag);
+
+	put_task_struct(p);
+	rcu_read_unlock();
+
+	return 0;
+}
+
+static int update_adpf(const char *buf, bool val)
+{
+	struct vendor_task_struct *vp;
+	struct rq_flags rf;
+	struct rq *rq;
+	struct task_struct *p;
+	pid_t pid;
+	bool old_adpf;
+
+	if (kstrtoint(buf, 0, &pid) || pid <= 0)
+		return -EINVAL;
+
+	rcu_read_lock();
+	p = find_task_by_vpid(pid);
+	if (!p) {
+		rcu_read_unlock();
+		return -ESRCH;
+	}
+
+	get_task_struct(p);
+
+	if (!check_cred(p)) {
+		put_task_struct(p);
+		rcu_read_unlock();
+		return -EACCES;
+	}
+
+	vp = get_vendor_task_struct(p);
+	rq = task_rq_lock(p, &rf);
+
+	old_adpf = !!(vp->sched_qos_user_defined_flag & BIT(SCHED_QOS_ADPF_BIT));
+
+	if (val)
+		set_bit(SCHED_QOS_ADPF_BIT, &vp->sched_qos_user_defined_flag);
+	else
+		clear_bit(SCHED_QOS_ADPF_BIT, &vp->sched_qos_user_defined_flag);
+
+	update_adpf_counter(p, old_adpf);
+
+
+	task_rq_unlock(rq, p, &rf);
+
+	put_task_struct(p);
+	rcu_read_unlock();
+
+	return 0;
+}
+
+static int update_preempt_wakeup(const char *buf, bool val)
+{
+	struct vendor_task_struct *vp;
+	struct task_struct *p;
+	pid_t pid;
+
+	if (kstrtoint(buf, 0, &pid) || pid <= 0)
+		return -EINVAL;
+
+	rcu_read_lock();
+	p = find_task_by_vpid(pid);
+	if (!p) {
+		rcu_read_unlock();
+		return -ESRCH;
+	}
+
+	get_task_struct(p);
+
+	if (!check_cred(p)) {
+		put_task_struct(p);
+		rcu_read_unlock();
+		return -EACCES;
+	}
+
+	vp = get_vendor_task_struct(p);
+
+	if (val)
+		set_bit(SCHED_QOS_PREEMPT_WAKEUP_BIT, &vp->sched_qos_user_defined_flag);
+	else
+		clear_bit(SCHED_QOS_PREEMPT_WAKEUP_BIT, &vp->sched_qos_user_defined_flag);
+
+	put_task_struct(p);
+	rcu_read_unlock();
+
+	return 0;
+}
+
+static int update_auto_uclamp_max(const char *buf, bool val)
+{
+	struct vendor_task_struct *vp;
+	struct task_struct *p;
+	pid_t pid;
+
+	if (kstrtoint(buf, 0, &pid) || pid <= 0)
+		return -EINVAL;
+
+	rcu_read_lock();
+	p = find_task_by_vpid(pid);
+	if (!p) {
+		rcu_read_unlock();
+		return -ESRCH;
+	}
+
+	get_task_struct(p);
+
+	if (!check_cred(p)) {
+		put_task_struct(p);
+		rcu_read_unlock();
+		return -EACCES;
+	}
+
+	vp = get_vendor_task_struct(p);
+
+	if (val)
+		set_bit(SCHED_QOS_AUTO_UCLAMP_MAX_BIT, &vp->sched_qos_user_defined_flag);
+	else
+		clear_bit(SCHED_QOS_AUTO_UCLAMP_MAX_BIT, &vp->sched_qos_user_defined_flag);
+
+	put_task_struct(p);
+	rcu_read_unlock();
+
+	return 0;
+}
+
+static int update_prefer_high_cap(const char *buf, bool val)
+{
+	struct vendor_task_struct *vp;
+	struct task_struct *p;
+	pid_t pid;
+
+	if (kstrtoint(buf, 0, &pid) || pid <= 0)
+		return -EINVAL;
+
+	rcu_read_lock();
+	p = find_task_by_vpid(pid);
+	if (!p) {
+		rcu_read_unlock();
+		return -ESRCH;
+	}
+
+	get_task_struct(p);
+
+	if (!check_cred(p)) {
+		put_task_struct(p);
+		rcu_read_unlock();
+		return -EACCES;
+	}
+
+	vp = get_vendor_task_struct(p);
+
+	if (val)
+		set_bit(SCHED_QOS_PREFER_HIGH_CAP_BIT, &vp->sched_qos_user_defined_flag);
+	else
+		clear_bit(SCHED_QOS_PREFER_HIGH_CAP_BIT, &vp->sched_qos_user_defined_flag);
+
+	put_task_struct(p);
+	rcu_read_unlock();
+
+	return 0;
+}
+
+/*
+ * To set per task rampup multiplier, write the format of pid:multiplier.
+ */
+static int update_rampup_multiplier_set(const char *buf, int count)
+{
+	struct vendor_task_struct *vp;
+	struct task_struct *p;
+	pid_t pid;
+	unsigned int multiplier;
+	char *str1, *str2, *pid_str, *multiplier_str;
+	int ret = 0;
+
+	str1 = kstrndup(buf, count, GFP_KERNEL);
+	if (!str1)
+		return -ENOMEM;
+
+	str2 = str1;
+	pid_str = strsep(&str2, ":");
+	multiplier_str = str2;
+
+	if (pid_str == NULL || multiplier_str == NULL) {
+		ret = -EINVAL;
+		goto error_free;
+	}
+
+	if (kstrtouint(pid_str, 0, &pid) || kstrtouint(multiplier_str, 0, &multiplier)) {
+		ret = -EINVAL;
+		goto error_free;
+	}
+
+	rcu_read_lock();
+	p = find_task_by_vpid(pid);
+	if (!p) {
+		ret = -ESRCH;
+		goto error_unlock;
+	}
+
+	get_task_struct(p);
+
+	if (!check_cred(p)) {
+		ret = -EACCES;
+		goto error_put_task;
+	}
+
+	vp = get_vendor_task_struct(p);
+	vp->rampup_multiplier = multiplier;
+	set_bit(SCHED_QOS_RAMPUP_MULTIPLIER_BIT, &vp->sched_qos_user_defined_flag);
+
+error_put_task:
+	put_task_struct(p);
+error_unlock:
+	rcu_read_unlock();
+error_free:
+	kfree(str1);
+
+	return ret;
+}
+
+/*
+ * To clear per task rampup multiplier, just write pid.
+ */
+static int update_rampup_multiplier_clear(const char *buf, int count)
+{
+	struct vendor_task_struct *vp;
+	struct task_struct *p;
+	pid_t pid;
+
+	if (kstrtoint(buf, 0, &pid) || pid <= 0)
+		return -EINVAL;
+
+	rcu_read_lock();
+	p = find_task_by_vpid(pid);
+	if (!p) {
+		rcu_read_unlock();
+		return -ESRCH;
+	}
+
+	get_task_struct(p);
+
+	if (!check_cred(p)) {
+		put_task_struct(p);
+		rcu_read_unlock();
+		return -EACCES;
+	}
+
+	vp = get_vendor_task_struct(p);
+	vp->rampup_multiplier = 1;
+	clear_bit(SCHED_QOS_RAMPUP_MULTIPLIER_BIT, &vp->sched_qos_user_defined_flag);
+
+	put_task_struct(p);
+	rcu_read_unlock();
+
+	return 0;
+}
+
+/*
+ * To set per task tag nice, write the format of pid:tag_nice.
+ */
+static int update_tag_nice_set(const char *buf, int count)
+{
+	struct vendor_task_struct *vp;
+	struct task_struct *p;
+	pid_t pid;
+	int tag_nice;
+	char *str1, *str2, *pid_str, *tag_nice_str;
+	int ret = 0;
+
+	mutex_lock(&task_prio_lock);
+
+	str1 = kstrndup(buf, count, GFP_KERNEL);
+	if (!str1) {
+		mutex_unlock(&task_prio_lock);
+		return -ENOMEM;
+	}
+
+	str2 = str1;
+	pid_str = strsep(&str2, ":");
+	tag_nice_str = str2;
+
+	if (pid_str == NULL || tag_nice_str == NULL) {
+		ret = -EINVAL;
+		goto error_free;
+	}
+
+	if (kstrtouint(pid_str, 0, &pid) || kstrtoint(tag_nice_str, 0, &tag_nice)) {
+		ret = -EINVAL;
+		goto error_free;
+	}
+
+	if (tag_nice > MAX_NICE || tag_nice < MIN_NICE) {
+		ret = -EINVAL;
+		goto error_free;
+	}
+
+	rcu_read_lock();
+	p = find_task_by_vpid(pid);
+	if (!p) {
+		ret = -ESRCH;
+		goto error_unlock;
+	}
+
+	get_task_struct(p);
+	vp = get_vendor_task_struct(p);
+
+	/* Do not allow to set it if boost_prio is set already. */
+	if ((vp->sched_qos_user_defined_flag & BIT(SCHED_QOS_BOOST_PRIO_BIT))) {
+		ret = -EINVAL;
+		goto error_put_task;
+	}
+
+	if (!check_cred(p)) {
+		ret = -EACCES;
+		goto error_put_task;
+	}
+
+	vp->tag_nice = tag_nice;
+	set_bit(SCHED_QOS_TAG_NICE_BIT, &vp->sched_qos_user_defined_flag);
+
+	if (vg[vp->group].qos_tag_nice_enable) {
+		struct rq *rq;
+		struct rq_flags rf;
+
+		rq = task_rq_lock(p, &rf);
+		update_task_prio(p, vp, true, NICE_TO_PRIO(tag_nice));
+		task_rq_unlock(rq, p, &rf);
+	}
+
+error_put_task:
+	put_task_struct(p);
+error_unlock:
+	rcu_read_unlock();
+error_free:
+	kfree(str1);
+
+	mutex_unlock(&task_prio_lock);
+	return ret;
+}
+
+/*
+ * To clear per task rampup multiplier, just write pid.
+ */
+static int update_tag_nice_clear(const char *buf, int count)
+{
+	struct vendor_task_struct *vp;
+	struct task_struct *p;
+	pid_t pid;
+	struct rq *rq;
+	struct rq_flags rf;
+
+	mutex_lock(&task_prio_lock);
+
+	if (kstrtoint(buf, 0, &pid) || pid <= 0) {
+		mutex_unlock(&task_prio_lock);
+		return -EINVAL;
+	}
+
+	rcu_read_lock();
+	p = find_task_by_vpid(pid);
+	if (!p) {
+		rcu_read_unlock();
+		mutex_unlock(&task_prio_lock);
+		return -ESRCH;
+	}
+
+	get_task_struct(p);
+	vp = get_vendor_task_struct(p);
+
+	/* Do not allow to clear it if boost_prio is set already. */
+	if ((vp->sched_qos_user_defined_flag & BIT(SCHED_QOS_BOOST_PRIO_BIT))) {
+		put_task_struct(p);
+		rcu_read_unlock();
+		mutex_unlock(&task_prio_lock);
+		return -EINVAL;
+	}
+
+	if (!check_cred(p)) {
+		put_task_struct(p);
+		rcu_read_unlock();
+		mutex_unlock(&task_prio_lock);
+		return -EACCES;
+	}
+
+	clear_bit(SCHED_QOS_TAG_NICE_BIT, &vp->sched_qos_user_defined_flag);
+	vp->tag_nice = 0;
+
+	/* Reset the nice to its original value. */
+	rq = task_rq_lock(p, &rf);
+	update_task_prio(p, vp, false, vp->orig_prio);
+	task_rq_unlock(rq, p, &rf);
+
+	put_task_struct(p);
+	rcu_read_unlock();
+	mutex_unlock(&task_prio_lock);
+
+	return 0;
+}
+
+/*
+ * sched qos profiles that need to take effect immediately.
+ */
+static void __update_sched_qos_profiles(struct task_struct *p, struct vendor_task_struct *vp,
+	bool old_adpf)
+{
+	bool old, new;
+
+	/* update adpf counter */
+	update_adpf_counter(p, old_adpf);
+
+	/* Clear boost_prio if tag nice is set. */
+	if (vp->sched_qos_user_defined_flag & BIT(SCHED_QOS_TAG_NICE_BIT)) {
+		clear_bit(SCHED_QOS_BOOST_PRIO_BIT, &vp->sched_qos_user_defined_flag);
+	} else {
+		/* boost prio */
+		old = !!(vp->prev_sched_qos_user_defined_flag & BIT(SCHED_QOS_BOOST_PRIO_BIT));
+		new = !!(vp->sched_qos_user_defined_flag & BIT(SCHED_QOS_BOOST_PRIO_BIT));
+
+		if (old != new) {
+			/*
+			 * Only boost task prio when both new and group qos_boost_prio_enable are
+			 * true.
+			 */
+			if (new && vg[vp->group].qos_boost_prio_enable) {
+				update_task_prio(p, vp, true, NICE_TO_PRIO(MIN_NICE));
+			} else {
+				update_task_prio(p, vp, false, -1);
+			}
+		}
+	}
+}
+
+static int update_sched_qos_profiles(const char *buf, enum vendor_sched_qos profile)
+{
+	struct vendor_task_struct *vp;
+	struct task_struct *p;
+	struct rq_flags rf;
+	struct rq *rq;
+	bool old_adpf;
+	pid_t pid;
+
+	mutex_lock(&task_prio_lock);
+
+	if (kstrtoint(buf, 0, &pid) || pid <= 0) {
+		mutex_unlock(&task_prio_lock);
+		return -EINVAL;
+	}
+
+	rcu_read_lock();
+	p = find_task_by_vpid(pid);
+	if (!p) {
+		rcu_read_unlock();
+		mutex_unlock(&task_prio_lock);
+		return -ESRCH;
+	}
+
+	get_task_struct(p);
+
+	if (!check_cred(p)) {
+		put_task_struct(p);
+		rcu_read_unlock();
+		mutex_unlock(&task_prio_lock);
+		return -EACCES;
+	}
+
+	vp = get_vendor_task_struct(p);
+	vp->sched_qos_profile = profile;
+	vp->prev_sched_qos_user_defined_flag = vp->sched_qos_user_defined_flag;
+
+	rq = task_rq_lock(p, &rf);
+
+	old_adpf = get_adpf(p, true);
+	/*
+	 Clear all bits except SCHED_QOS_RAMPUP_MULTIPLIER_BIT and SCHED_QOS_TAG_NICE_BIT.
+	*/
+	vp->sched_qos_user_defined_flag &= BIT(SCHED_QOS_RAMPUP_MULTIPLIER_BIT) |
+					   BIT(SCHED_QOS_TAG_NICE_BIT);
+	vp->sched_qos_user_defined_flag |= SCHED_QOS_PROFILES[vp->sched_qos_profile];
+
+	__update_sched_qos_profiles(p, vp, old_adpf);
+
+	task_rq_unlock(rq, p, &rf);
+	put_task_struct(p);
+	rcu_read_unlock();
+	mutex_unlock(&task_prio_lock);
+
+	return 0;
+}
+
+static int update_sched_qos_none(const char *buf, int count)
+{
+	return update_sched_qos_profiles(buf, SCHED_QOS_NONE);
+}
+
+static int update_sched_qos_power_efficiency(const char *buf, int count)
+{
+	return update_sched_qos_profiles(buf, SCHED_QOS_POWER_EFFICIENCY);
+}
+
+static int update_sched_qos_sensitive_standard(const char *buf, int count)
+{
+	return update_sched_qos_profiles(buf, SCHED_QOS_SENSITIVE_STANDARD);
+}
+
+static int update_sched_qos_sensitive_high(const char *buf, int count)
+{
+	return update_sched_qos_profiles(buf, SCHED_QOS_SENSITIVE_HIGH);
+}
+
+static int update_sched_qos_sensitive_extreme(const char *buf, int count)
+{
+	return update_sched_qos_profiles(buf, SCHED_QOS_SENSITIVE_EXTREME);
+}
+
+enum {
+	VENDOR_SCHED_ATTR_UNSPEC,
+	VENDOR_SCHED_ATTR_TGID,
+	VENDOR_SCHED_ATTR_UID,
+	VENDOR_SCHED_ATTR_CMDLINE,
+	VENDOR_SCHED_ATTR_OLD_GROUP,
+	VENDOR_SCHED_ATTR_NEW_GROUP,
+
+	__VENDOR_SCHED_ATTR_MAX,
+};
+#define VENDOR_SCHED_ATTR_MAX (__VENDOR_SCHED_ATTR_MAX - 1)
+
+enum {
+	VENDOR_SCHED_CMD_UNSPEC,
+	VENDOR_SCHED_CMD_GROUP_MIGRATION,
+	__VENDOR_SCHED_CMD_MAX,
+};
+#define VENDOR_SCHED_CMD_MAX (__VENDOR_SCHED_CMD_MAX - 1)
+
+static const struct nla_policy vendor_sched_genl_policy[VENDOR_SCHED_ATTR_MAX + 1] = {
+	[VENDOR_SCHED_ATTR_TGID] = { .type = NLA_U32 },
+	[VENDOR_SCHED_ATTR_UID] = { .type = NLA_U32 },
+	[VENDOR_SCHED_ATTR_CMDLINE] = { .type = NLA_NUL_STRING },
+	[VENDOR_SCHED_ATTR_OLD_GROUP] = { .type = NLA_U32 },
+	[VENDOR_SCHED_ATTR_NEW_GROUP] = { .type = NLA_U32 },
+};
+
+enum vendor_sched_multicast_groups {
+	VENDOR_SCHED_MCGRP_GROUP_MIGRATION,
+};
+
+static const struct genl_multicast_group vendor_sched_mcgrps[] = {
+	[VENDOR_SCHED_MCGRP_GROUP_MIGRATION] = { .name = "group_migration", },
+};
+
+static struct genl_family vendor_sched_gnl_family = {
+	.name = "VENDOR_SCHED",
+	.version = 1,
+	.maxattr = VENDOR_SCHED_ATTR_MAX,
+	.policy = vendor_sched_genl_policy,
+	.module = THIS_MODULE,
+	.mcgrps = vendor_sched_mcgrps,
+	.n_mcgrps = ARRAY_SIZE(vendor_sched_mcgrps),
+};
+
+struct group_migration_work {
+	struct delayed_work dwork;
+	struct task_struct *task;
+	int old_group;
+	int new_group;
+};
+
+static void netlink_notification_work_handler(struct work_struct *work)
+{
+	struct group_migration_work *gm_work = container_of(to_delayed_work(work),
+		struct group_migration_work, dwork);
+	struct task_struct *p = gm_work->task;
+	char cmdline[VENDOR_CMDLINE_LEN];
+	struct sk_buff *skb;
+	void *msg_head;
+	const struct cred *cred;
+	uid_t uid;
+	int ret, len;
+
+	if (unlikely(p->flags & PF_EXITING))
+		goto out_free;
+
+	/* Safe to sleep and block here! */
+	len = get_cmdline(p, cmdline, sizeof(cmdline) - 1);
+	cmdline[len] = '\0';
+
+	rcu_read_lock();
+	cred = __task_cred(p);
+	if (unlikely(!cred)) {
+		rcu_read_unlock();
+		goto out_free;
+	}
+	uid = cred->uid.val;
+	rcu_read_unlock();
+
+	skb = genlmsg_new(NLMSG_GOODSIZE, GFP_KERNEL);
+	if (!skb)
+		goto out_free;
+
+	msg_head = genlmsg_put(skb, 0, 0, &vendor_sched_gnl_family, 0,
+			       VENDOR_SCHED_CMD_GROUP_MIGRATION);
+	if (!msg_head) {
+		nlmsg_free(skb);
+		goto out_free;
+	}
+
+	if (nla_put_u32(skb, VENDOR_SCHED_ATTR_TGID, p->tgid))
+		goto nla_put_failure;
+
+	if (nla_put_u32(skb, VENDOR_SCHED_ATTR_UID, uid))
+		goto nla_put_failure;
+
+	if (nla_put_string(skb, VENDOR_SCHED_ATTR_CMDLINE, cmdline))
+		goto nla_put_failure;
+
+	if (nla_put_u32(skb, VENDOR_SCHED_ATTR_OLD_GROUP, gm_work->old_group))
+		goto nla_put_failure;
+
+	if (nla_put_u32(skb, VENDOR_SCHED_ATTR_NEW_GROUP, gm_work->new_group))
+		goto nla_put_failure;
+
+	genlmsg_end(skb, msg_head);
+
+	ret = genlmsg_multicast(&vendor_sched_gnl_family, skb, 0,
+			       VENDOR_SCHED_MCGRP_GROUP_MIGRATION, GFP_KERNEL);
+	if (ret < 0 && ret != -ESRCH)
+		pr_warn("failed to send group migration notification: %d\n", ret);
+
+	goto out_free;
+
+nla_put_failure:
+	genlmsg_cancel(skb, msg_head);
+	nlmsg_free(skb);
+out_free:
+	put_task_struct(p);
+	kfree(gm_work);
+}
+
+static void queue_netlink_notification(struct task_struct *p, int old, int new)
+{
+	struct group_migration_work *gm_work;
+
+	gm_work = kmalloc(sizeof(*gm_work), GFP_ATOMIC);
+	if (!gm_work)
+		return;
+
+	get_task_struct(p);
+	gm_work->task = p;
+	gm_work->old_group = old;
+	gm_work->new_group = new;
+
+	INIT_DELAYED_WORK(&gm_work->dwork, netlink_notification_work_handler);
+	/* delay to wait cmdline and setuid to be ready */
+	queue_delayed_work(system_highpri_wq, &gm_work->dwork,
+			   msecs_to_jiffies(VENDOR_SCHED_NETLINK_DELAY_MS));
+}
+
+static inline void migrate_task_prio(struct task_struct *p, unsigned int old, unsigned int new)
+{
+	struct vendor_task_struct *vp = get_vendor_task_struct(p);
+
+	/* We expect only one of boost_prio or tag_nice to be set. */
+	if (vp->sched_qos_user_defined_flag & BIT(SCHED_QOS_BOOST_PRIO_BIT) &&
+	    vg[old].qos_boost_prio_enable != vg[new].qos_boost_prio_enable) {
+		/* Boost prio to 100. */
+		if (vg[new].qos_boost_prio_enable)
+			update_task_prio(p, vp, true, NICE_TO_PRIO(MIN_NICE));
+		/* Restore to original prio. */
+		else
+			update_task_prio(p, vp, false, vp->orig_prio);
+	/* Moving between groups with boost prio enabled, do nothing to keep the prio boosted. */
+	} else if (vp->sched_qos_user_defined_flag & BIT(SCHED_QOS_BOOST_PRIO_BIT) &&
+		   vg[old].qos_boost_prio_enable && vg[new].qos_boost_prio_enable) {
+		return;
+	} else if (vp->sched_qos_user_defined_flag & BIT(SCHED_QOS_TAG_NICE_BIT) &&
+		   vg[old].qos_tag_nice_enable != vg[new].qos_tag_nice_enable) {
+		/* Boost prio to tag_nice. */
+		if (vg[new].qos_tag_nice_enable)
+			update_task_prio(p, vp, true, NICE_TO_PRIO(vp->tag_nice));
+		/* Restore to original prio. */
+		else
+			update_task_prio(p, vp, false, vp->orig_prio);
+	}
+}
+
+static inline void update_vendor_group_attribute(struct task_struct *p, int new)
+{
+	struct vendor_task_struct_h *vph = get_vendor_task_struct_h(p);
+	struct vendor_task_struct *vp = get_vendor_task_struct(p);
+	enum uclamp_id clamp_id;
+	unsigned long irqflags;
+	struct rq_flags rf;
+	struct rq *rq;
+	bool old_adpf;
+	int old;
+	bool should_notify = false;
+
+	rq = task_rq_lock(p, &rf);
+	raw_spin_lock_irqsave(&vp->lock, irqflags);
+
+	old = vp->group;
+	old_adpf = get_adpf(p, true);
+
+	if (p->flags & PF_EXITING) {
+		raw_spin_unlock_irqrestore(&vp->lock, irqflags);
+		task_rq_unlock(rq, p, &rf);
+		return;
+	}
+
+	if (p->pid == p->tgid && vp->last_notified_group != new) {
+		should_notify = true;
+		vp->last_notified_group = new;
+	}
+
+	if (old == new) {
+		raw_spin_unlock_irqrestore(&vp->lock, irqflags);
+		task_rq_unlock(rq, p, &rf);
+		if (should_notify)
+			queue_netlink_notification(p, old, new);
+		return;
+	}
+
+	if (vp->queued_to_list == LIST_QUEUED) {
+		remove_from_vendor_group_list(&vph->node, old);
+		add_to_vendor_group_list(&vph->node, new);
+	}
+
+	vp->group = new;
+	/* check adpf counter with new group qos config and
+	 * old_adpf already included old group qos config.
+	 */
+	update_adpf_counter(p, old_adpf);
+
+	if (vg[old].use_batch_policy != vg[new].use_batch_policy)
+		set_batch_policy_locked(p, new);
+
+	for (clamp_id = 0; clamp_id < UCLAMP_CNT; clamp_id++)
+		uclamp_update_active_locked(p, clamp_id);
+
+	raw_spin_unlock_irqrestore(&vp->lock, irqflags);
+
+	if (p->prio >= MAX_RT_PRIO) {
+		/* check task prio boost */
+		migrate_task_prio(p, old, new);
+#if IS_ENABLED(CONFIG_USE_VENDOR_GROUP_UTIL)
+		/* vender group util migration */
+		migrate_vendor_group_util(p, old, new);
+#endif
+	}
+
+	task_rq_unlock(rq, p, &rf);
+
+	/* check affinity */
+	if (vg[new].disable_sched_setaffinity)
+		__reset_task_affinity(p, NULL);
+	else if (vg[new].disable_sched_setaffinity_mask)
+		__reset_task_affinity(p, p->cpus_ptr);
+
+	send_trace_sched_group_tracker(p, false);
+
+	if (should_notify)
+		queue_netlink_notification(p, old, new);
+}
+
+static int update_vendor_group(const char *buf, enum vendor_group_attribute vta,
+					 unsigned int new)
+{
+	struct task_struct *p, *t;
+	pid_t pid;
+
+	if (kstrtoint(buf, 0, &pid) || pid <= 0)
+		return -EINVAL;
+
+	rcu_read_lock();
+	p = find_task_by_vpid(pid);
+	if (!p) {
+		rcu_read_unlock();
+		return -ESRCH;
+	}
+
+	get_task_struct(p);
+
+	if (!check_cred(p)) {
+		put_task_struct(p);
+		rcu_read_unlock();
+		return -EACCES;
+	}
+	rcu_read_unlock();
+
+	switch (vta) {
+	case VTA_TASK_GROUP:
+		update_vendor_group_attribute(p, new);
+		break;
+	case VTA_PROC_GROUP:
+		rcu_read_lock();
+		for_each_thread(p, t) {
+			get_task_struct(t);
+			update_vendor_group_attribute(t, new);
+			put_task_struct(t);
+		}
+		rcu_read_unlock();
+		break;
+	default:
+		break;
+	}
+
+	put_task_struct(p);
+
+	return 0;
+}
+
+static void apply_adpf_adj_change(struct task_struct *p, int adj)
+{
+	int ucmax, ucmin, pct, pct2util;
+	unsigned long irqflags;
+	struct rq_flags rf;
+	struct rq *rq;
+	struct vendor_task_struct *vp;
+
+	vp = get_vendor_task_struct(p);
+	vp->adpf_adj = adj;
+
+	// Reserved 11 bits for uclamp min and max and 10 bits for percentage hint.
+	ucmin = adj & 0x7FF;
+	ucmax = (adj >> 11) & 0x7FF;
+	pct = (adj >> 22) & 0x3FF;
+	pct2util = vp->real_cap_avg * pct / 100;
+
+	ucmin = max(ucmin, pct2util);
+	ucmin = min(ucmin, ucmax);
+
+	rq = task_rq_lock(p, &rf);
+
+	ucmin = min(ucmin, (int)SCHED_CAPACITY_SCALE);
+	if (p->uclamp[UCLAMP_MIN].active) {
+		uclamp_rq_dec_id(rq, p, UCLAMP_MIN);
+		uclamp_se_set(&p->uclamp_req[UCLAMP_MIN], ucmin, true);
+		uclamp_rq_inc_id(rq, p, UCLAMP_MIN);
+	} else {
+		uclamp_se_set(&p->uclamp_req[UCLAMP_MIN], ucmin, true);
+	}
+	vh_sched_setscheduler_uclamp_pixel_mod(NULL, p, UCLAMP_MIN, ucmin);
+
+	task_rq_unlock(rq, p, &rf);
+
+	raw_spin_lock_irqsave(&vp->lock, irqflags);
+	vp->real_cap_avg = 0;
+	vp->real_cap_total_ns = 0;
+	raw_spin_unlock_irqrestore(&vp->lock, irqflags);
+}
+
+static int update_sched_adpf_adjustment(const char *buf, int count)
+{
+	char *tok, *str1, *str2, *pid_str, *adj_str;
+	unsigned int pid;
+	int adj;
+	struct task_struct *p;
+
+	str1 = kstrndup(buf, count, GFP_KERNEL);
+	str2 = str1;
+
+	if (!str2)
+		return -ENOMEM;
+
+	while (1) {
+		tok = strsep(&str2, ",");
+
+		if (tok == NULL)
+			break;
+
+		pid_str = strsep(&tok, ":");
+		adj_str = tok;
+
+		if (kstrtouint(pid_str, 0, &pid))
+			goto fail;
+		if (kstrtoint(adj_str, 0, &adj))
+			goto fail;
+
+		rcu_read_lock();
+		p = find_task_by_vpid(pid);
+		if (!p) {
+			kfree(str1);
+			rcu_read_unlock();
+			return -ESRCH;
+		}
+
+		get_task_struct(p);
+		if (!check_cred(p)) {
+			kfree(str1);
+			put_task_struct(p);
+			rcu_read_unlock();
+			return -EACCES;
+		}
+		rcu_read_unlock();
+		if (get_adpf(p, false))
+			apply_adpf_adj_change(p, adj);
+		put_task_struct(p);
+	}
+
+	kfree(str1);
+	return count;
+fail:
+	kfree(str1);
+	return -EINVAL;
+}
+
+SET_VENDOR_GROUP_STORE(ta, VG_TOPAPP);
+SET_VENDOR_GROUP_STORE(fg, VG_FOREGROUND);
+// VG_SYSTEM is default setting so set to VG_SYSTEM is essentially clear vendor group
+SET_VENDOR_GROUP_STORE(sys, VG_SYSTEM);
+SET_VENDOR_GROUP_STORE(cam, VG_CAMERA);
+SET_VENDOR_GROUP_STORE(cam_power, VG_CAMERA_POWER);
+SET_VENDOR_GROUP_STORE(bg, VG_BACKGROUND);
+SET_VENDOR_GROUP_STORE(sysbg, VG_SYSTEM_BACKGROUND);
+SET_VENDOR_GROUP_STORE(nnapi, VG_NNAPI_HAL);
+SET_VENDOR_GROUP_STORE(rt, VG_RT);
+SET_VENDOR_GROUP_STORE(dex2oat, VG_DEX2OAT);
+SET_VENDOR_GROUP_STORE(ota, VG_OTA);
+SET_VENDOR_GROUP_STORE(sf, VG_SF);
+SET_VENDOR_GROUP_STORE(fg_wi, VG_FOREGROUND_WINDOW);
+
+// Create per-task attribute nodes
+PER_TASK_BOOL_ATTRIBUTE(prefer_idle);
+PER_TASK_BOOL_ATTRIBUTE(boost_prio);
+PER_TASK_BOOL_ATTRIBUTE(prefer_fit);
+PER_TASK_BOOL_ATTRIBUTE(adpf);
+PER_TASK_BOOL_ATTRIBUTE(preempt_wakeup);
+PER_TASK_BOOL_ATTRIBUTE(auto_uclamp_max);
+PER_TASK_BOOL_ATTRIBUTE(prefer_high_cap);
+PER_TASK_UINT_ATTRIBUTE(rampup_multiplier_set);
+PER_TASK_UINT_ATTRIBUTE(rampup_multiplier_clear);
+PER_TASK_UINT_ATTRIBUTE(tag_nice_set);
+PER_TASK_UINT_ATTRIBUTE(tag_nice_clear);
+PER_TASK_UINT_ATTRIBUTE(sched_qos_none);
+PER_TASK_UINT_ATTRIBUTE(sched_qos_power_efficiency);
+PER_TASK_UINT_ATTRIBUTE(sched_qos_sensitive_standard);
+PER_TASK_UINT_ATTRIBUTE(sched_qos_sensitive_high);
+PER_TASK_UINT_ATTRIBUTE(sched_qos_sensitive_extreme);
+
+static int dump_task_show(struct seq_file *m, void *v)
+{
+	struct task_struct *p, *t;
+	struct vendor_task_struct *vp;
+	u64 real_cap_avg;
+	unsigned int uclamp_min, uclamp_max, uclamp_eff_min, uclamp_eff_max, adpf_adj;
+	int tag_nice;
+	enum vendor_group group;
+	const char *grp_name = "unknown";
+	unsigned int rampup_multiplier;
+
+	seq_puts(m, "pid comm group uclamp_min uclamp_max uclamp_eff_min uclamp_eff_max ");
+	seq_puts(m, "adpf_adj real_cap_avg sched_qos_user_defined_flag rampup_multiplier ");
+	seq_puts(m, "effect_rampup_multiplier tag_nice\n");
+
+	rcu_read_lock();
+
+	for_each_process_thread(p, t) {
+		get_task_struct(t);
+		vp = get_vendor_task_struct(t);
+		adpf_adj = vp->adpf_adj;
+		real_cap_avg = vp->real_cap_avg;
+		group = vp->group;
+		if (group >= 0 && group < VG_MAX)
+			grp_name = GRP_NAME[group];
+		uclamp_min = t->uclamp_req[UCLAMP_MIN].value;
+		uclamp_max = t->uclamp_req[UCLAMP_MAX].value;
+		uclamp_eff_min = uclamp_eff_value_pixel_mod(t, UCLAMP_MIN);
+		uclamp_eff_max = uclamp_eff_value_pixel_mod(t, UCLAMP_MAX);
+		rampup_multiplier = vp->rampup_multiplier;
+		tag_nice = vp->tag_nice;
+		put_task_struct(t);
+
+		seq_printf(m, "%u %s %s %u %u %u %u 0x%X %llu 0x%lx %u %u %d\n",
+			   t->pid, t->comm, grp_name, uclamp_min, uclamp_max, uclamp_eff_min,
+			   uclamp_eff_max, adpf_adj, real_cap_avg, vp->sched_qos_user_defined_flag,
+			   rampup_multiplier, get_rampup_multiplier(t), tag_nice);
+	}
+
+	rcu_read_unlock();
+
+	return 0;
+}
+
+PROC_OPS_RO(dump_task);
+
+static int pmu_stats_show(struct seq_file *m, void *v)
+{
+	struct task_struct *p, *t;
+	struct vendor_task_struct *vp;
+	unsigned long util, mem_stall_pressure, memory_access_pressure;
+	int i;
+	u64 total_inst;
+
+	seq_puts(m, "pid comm group task_util task_mem_stall_pressure mem_stall_pressure_ratio ");
+	seq_puts(m, "cluster_num stall_ratio_each_cluster ipc_each_cluster_x100 ");
+	seq_puts(m, "mem_access_pressure mem_access_pressure_ratio mem_access_avg_ratio\n");
+
+	rcu_read_lock();
+
+	for_each_process_thread(p, t) {
+		get_task_struct(t);
+		vp = get_vendor_task_struct(t);
+		util = max(task_util(t), 1);
+		mem_stall_pressure = vp->mp_stats.mp.mem_stall_pressure_avg;
+		memory_access_pressure = vp->mp_stats.mp.mem_access_pressure_avg;
+		total_inst = max(vp->mp_stats.pmu_stats.total_inst, 1);
+
+		seq_printf(m, "%u %s %s %lu %lu %lu %d ",
+			   t->pid, t->comm, GRP_NAME[vp->group], util, mem_stall_pressure,
+			   mem_stall_pressure * 100 / util, pixel_cluster_num);
+
+		/* stall ratio for each cluster */
+		for (i = 0; i < pixel_cluster_num; i++) {
+			u64 cycles = max(vp->mp_stats.pmu_stats.cycle[i], 1);
+
+			seq_printf(m, "%llu ", vp->mp_stats.pmu_stats.stall[i] * 100 / cycles);
+		}
+
+		/* ipc x 100 for each cluster */
+		for (i = 0; i < pixel_cluster_num; i++) {
+			u64 cycles = max(vp->mp_stats.pmu_stats.cycle[i], 1);
+
+			seq_printf(m, "%llu ", vp->mp_stats.pmu_stats.inst[i] * 100 / cycles);
+		}
+
+		seq_printf(m, "%lu %lu %llu", memory_access_pressure,
+			   memory_access_pressure * 100 / util,
+			   (vp->mp_stats.pmu_stats.total_mem_rd_inst +
+			    vp->mp_stats.pmu_stats.total_mem_wr_inst) * 100 / total_inst);
+
+		seq_puts(m, "\n");
+		put_task_struct(t);
+	}
+
+	rcu_read_unlock();
+
+	return 0;
+}
+
+PROC_OPS_RO(pmu_stats);
+
+static int util_threshold_show(struct seq_file *m, void *v)
+{
+	int i;
+
+	for (i = 0; i < pixel_cpu_num; i++) {
+		seq_printf(m, "%u ", sched_capacity_margin[i]);
+	}
+
+	seq_puts(m, "\n");
+
+	return 0;
+}
+
+static ssize_t util_threshold_store(struct file *filp,
+							const char __user *ubuf,
+							size_t count, loff_t *pos)
+{
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	return update_vendor_tunables(buf, count, SCHED_CAPACITY_MARGIN);
+}
+
+PROC_OPS_RW(util_threshold);
+
+static int thermal_cap_margin_show(struct seq_file *m, void *v)
+{
+	int i;
+
+	for (i = 0; i < pixel_cpu_num; i++) {
+		seq_printf(m, "%u ", thermal_cap_margin[i]);
+	}
+
+	seq_puts(m, "\n");
+
+	return 0;
+}
+
+static ssize_t thermal_cap_margin_store(struct file *filp,
+							const char __user *ubuf,
+							size_t count, loff_t *pos)
+{
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	return update_vendor_tunables(buf, count, SCHED_THERMAL_CAP_MARGIN);
+}
+
+PROC_OPS_RW(thermal_cap_margin);
+
+static int auto_uclamp_max_st_show(struct seq_file *m, void *v)
+{
+	int i;
+
+	for (i = 0; i < pixel_cpu_num; i++)
+		seq_printf(m, "%u ", sched_auto_uclamp_max[SCHED_AUTO_UCLAMP_MAX_ST][i]);
+
+	seq_puts(m, "\n");
+
+	return 0;
+}
+
+static ssize_t auto_uclamp_max_st_store(struct file *filp, const char __user *ubuf,
+				    size_t count, loff_t *pos)
+{
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	return update_vendor_tunables(buf, count, SCHED_MAX_UCLAMP_ST);
+}
+
+PROC_OPS_RW(auto_uclamp_max_st);
+
+static int auto_uclamp_max_st_util_threshold_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%u\n", auto_uclamp_max_st_util_threshold);
+	return 0;
+}
+static ssize_t auto_uclamp_max_st_util_threshold_store(struct file *filp, const char __user *ubuf,
+					     size_t count, loff_t *pos)
+{
+	unsigned int val;
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	if (kstrtouint(buf, 0, &val))
+		return -EINVAL;
+
+	auto_uclamp_max_st_util_threshold = val;
+
+	return count;
+}
+PROC_OPS_RW(auto_uclamp_max_st_util_threshold);
+
+static int dvfs_headroom_show(struct seq_file *m, void *v)
+{
+	int i;
+
+	for (i = 0; i < pixel_cpu_num; i++) {
+		seq_printf(m, "%u ", sched_dvfs_headroom[i]);
+	}
+
+	seq_puts(m, "\n");
+
+	return 0;
+}
+static ssize_t dvfs_headroom_store(struct file *filp,
+				  const char __user *ubuf,
+				  size_t count, loff_t *pos)
+{
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	return update_vendor_tunables(buf, count, SCHED_DVFS_HEADROOM);
+}
+PROC_OPS_RW(dvfs_headroom);
+
+static int tapered_dvfs_headroom_enable_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", static_branch_likely(&tapered_dvfs_headroom_enable) ? 1 : 0);
+	return 0;
+}
+static ssize_t tapered_dvfs_headroom_enable_store(struct file *filp,
+						  const char __user *ubuf,
+						  size_t count, loff_t *pos)
+{
+	int enable = 0;
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	if (kstrtoint(buf, 10, &enable))
+		return -EINVAL;
+
+	if (enable)
+		static_branch_enable(&tapered_dvfs_headroom_enable);
+	else
+		static_branch_disable(&tapered_dvfs_headroom_enable);
+
+	return count;
+}
+PROC_OPS_RW(tapered_dvfs_headroom_enable);
+
+static int auto_dvfs_headroom_enable_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", static_branch_likely(&auto_dvfs_headroom_enable) ? 1 : 0);
+	return 0;
+}
+static ssize_t auto_dvfs_headroom_enable_store(struct file *filp,
+					       const char __user *ubuf,
+					       size_t count, loff_t *pos)
+{
+	int enable = 0;
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	if (kstrtoint(buf, 10, &enable))
+		return -EINVAL;
+
+	if (enable)
+		static_branch_enable(&auto_dvfs_headroom_enable);
+	else
+		static_branch_disable(&auto_dvfs_headroom_enable);
+
+	return count;
+}
+PROC_OPS_RW(auto_dvfs_headroom_enable);
+
+static int response_time_ms_fix_enable_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", static_branch_likely(&response_time_ms_fix_enable) ? 1 : 0);
+	return 0;
+}
+static ssize_t response_time_ms_fix_enable_store(struct file *filp,
+						 const char __user *ubuf,
+						 size_t count, loff_t *pos)
+{
+	int enable = 0;
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	if (kstrtoint(buf, 10, &enable))
+		return -EINVAL;
+
+	if (enable)
+		static_branch_enable(&response_time_ms_fix_enable);
+	else
+		static_branch_disable(&response_time_ms_fix_enable);
+
+	return count;
+}
+PROC_OPS_RW(response_time_ms_fix_enable);
+
+static int auto_migration_margins_enable_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", static_branch_likely(&auto_migration_margins_enable) ? 1 : 0);
+	return 0;
+}
+static ssize_t auto_migration_margins_enable_store(struct file *filp,
+						   const char __user *ubuf,
+						   size_t count, loff_t *pos)
+{
+	int enable = 0;
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	if (kstrtoint(buf, 10, &enable))
+		return -EINVAL;
+
+	if (enable)
+		static_branch_enable(&auto_migration_margins_enable);
+	else
+		static_branch_disable(&auto_migration_margins_enable);
+
+	return count;
+}
+PROC_OPS_RW(auto_migration_margins_enable);
+
+static int per_task_memory_aware_enable_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", static_key_enabled(&per_task_memory_aware_enable) ? 1 : 0);
+	return 0;
+}
+static ssize_t per_task_memory_aware_enable_store(struct file *filp,
+						  const char __user *ubuf,
+						  size_t count, loff_t *pos)
+{
+	int enable = 0;
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	if (kstrtoint(buf, 10, &enable))
+		return -EINVAL;
+
+	if (enable)
+		static_branch_enable(&per_task_memory_aware_enable);
+	else
+		static_branch_disable(&per_task_memory_aware_enable);
+
+	return count;
+}
+PROC_OPS_RW(per_task_memory_aware_enable);
+
+static int eas_fork_exec_enable_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", static_key_enabled(&eas_fork_exec_enable) ? 1 : 0);
+	return 0;
+}
+static ssize_t eas_fork_exec_enable_store(struct file *filp,
+						  const char __user *ubuf,
+						  size_t count, loff_t *pos)
+{
+	int enable = 0;
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	if (kstrtoint(buf, 10, &enable))
+		return -EINVAL;
+
+	if (enable)
+		static_branch_enable(&eas_fork_exec_enable);
+	else
+		static_branch_disable(&eas_fork_exec_enable);
+
+	return count;
+}
+PROC_OPS_RW(eas_fork_exec_enable);
+
+static int memory_capacity_show(struct seq_file *m, void *v)
+{
+	int i;
+
+	for (i = 0; i < pixel_cpu_num; i++) {
+		seq_printf(m, "%u ", sched_memory_capacity[i]);
+	}
+
+	seq_puts(m, "\n");
+
+	return 0;
+}
+static ssize_t memory_capacity_store(struct file *filp,
+				  const char __user *ubuf,
+				  size_t count, loff_t *pos)
+{
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	return update_vendor_tunables(buf, count, SCHED_MEMORY_CAPACITY);
+}
+PROC_OPS_RW(memory_capacity);
+
+static int update_freq_on_idle_enable_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", static_branch_likely(&update_freq_on_idle_enable) ? 1 : 0);
+	return 0;
+}
+static ssize_t update_freq_on_idle_enable_store(struct file *filp,
+						const char __user *ubuf,
+						size_t count, loff_t *pos)
+{
+	int enable = 0;
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	if (kstrtoint(buf, 10, &enable))
+		return -EINVAL;
+
+	if (enable)
+		static_branch_enable(&update_freq_on_idle_enable);
+	else
+		static_branch_disable(&update_freq_on_idle_enable);
+
+	return count;
+}
+PROC_OPS_RW(update_freq_on_idle_enable);
+
+static int npi_packing_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%s\n", vendor_sched_npi_packing ? "true" : "false");
+
+	return 0;
+}
+
+static ssize_t npi_packing_store(struct file *filp,
+							const char __user *ubuf,
+							size_t count, loff_t *pos)
+{
+	bool enable;
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	if (kstrtobool(buf, &enable))
+		return -EINVAL;
+
+	vendor_sched_npi_packing = enable;
+
+	return count;
+}
+
+PROC_OPS_RW(npi_packing);
+
+static int reduce_prefer_idle_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%s\n", vendor_sched_reduce_prefer_idle ? "true" : "false");
+
+	return 0;
+}
+
+static ssize_t reduce_prefer_idle_store(struct file *filp, const char __user *ubuf,
+					size_t count, loff_t *pos)
+{
+	bool enable;
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	if (kstrtobool(buf, &enable))
+		return -EINVAL;
+
+	vendor_sched_reduce_prefer_idle = enable;
+
+	return count;
+}
+
+PROC_OPS_RW(reduce_prefer_idle);
+
+static int auto_prefer_idle_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%s\n", vendor_sched_auto_prefer_idle ? "true" : "false");
+
+	return 0;
+}
+
+static ssize_t auto_prefer_idle_store(struct file *filp, const char __user *ubuf,
+					size_t count, loff_t *pos)
+{
+	bool enable;
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	if (kstrtobool(buf, &enable))
+		return -EINVAL;
+
+	vendor_sched_auto_prefer_idle = enable;
+
+	return count;
+}
+
+PROC_OPS_RW(auto_prefer_idle);
+
+static int skip_prefer_prev_mask_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "0x%lx\n", skip_prefer_prev_mask.bits[0]);
+
+	return 0;
+}
+static ssize_t skip_prefer_prev_mask_store(struct file *filp,
+					  const char __user *ubuf,
+					  size_t count, loff_t *pos)
+{
+	int ret;
+
+	ret = cpumask_parse_user(ubuf, count, &skip_prefer_prev_mask);
+	if (ret)
+		return ret;
+
+	return count;
+}
+PROC_OPS_RW(skip_prefer_prev_mask);
+
+#if IS_ENABLED(CONFIG_UCLAMP_STATS)
+static int uclamp_stats_show(struct seq_file *m, void *v)
+{
+	int i, j, index;
+	struct uclamp_stats *stats;
+
+	seq_puts(m, "V, T(ms), %%\n");
+	for (i = 0; i < pixel_cpu_num; i++) {
+		stats = &per_cpu(uclamp_stats, i);
+		seq_printf(m, "CPU %d - total time: %llu ms\n", i, stats->total_time \
+		/ NSEC_PER_MSEC);
+		seq_puts(m, "uclamp.min\n");
+
+		for (j = 0, index = 0; j < UCLAMP_STATS_SLOTS; j++, index += UCLAMP_STATS_STEP) {
+			seq_printf(m, "%d, %llu, %llu%%\n", index,
+					stats->time_in_state_min[j] / NSEC_PER_MSEC,
+					stats->time_in_state_min[j] / (stats->total_time / 100));
+		}
+
+		seq_puts(m, "uclamp.max\n");
+
+		for (j = 0, index = 0; j < UCLAMP_STATS_SLOTS; j++, index += UCLAMP_STATS_STEP) {
+			seq_printf(m, "%d, %llu, %llu%%\n", index,
+					stats->time_in_state_max[j] / NSEC_PER_MSEC,
+					stats->time_in_state_max[j] / (stats->total_time / 100));
+		}
+	}
+
+	return 0;
+}
+
+PROC_OPS_RO(uclamp_stats);
+
+static int uclamp_effective_stats_show(struct seq_file *m, void *v)
+{
+	int i, j, index;
+	struct uclamp_stats *stats;
+
+	seq_puts(m, "V, T(ms), %%(Based on T in uclamp_stats)\n");
+	for (i = 0; i < pixel_cpu_num; i++) {
+		stats = &per_cpu(uclamp_stats, i);
+
+		seq_printf(m, "CPU %d\n", i);
+		seq_puts(m, "uclamp.min\n");
+		for (j = 0, index = 0; j < UCLAMP_STATS_SLOTS; j++, index += UCLAMP_STATS_STEP) {
+			seq_printf(m, "%d, %llu, %llu%%\n", index,
+					stats->effect_time_in_state_min[j] / NSEC_PER_MSEC,
+					stats->effect_time_in_state_min[j] /
+					(stats->time_in_state_min[j] / 100));
+		}
+
+		seq_puts(m, "uclamp.max\n");
+		for (j = 0, index = 0; j < UCLAMP_STATS_SLOTS; j++, index += UCLAMP_STATS_STEP) {
+			seq_printf(m, "%d, %llu, %llu%%\n", index,
+					stats->effect_time_in_state_max[j] / NSEC_PER_MSEC,
+					stats->effect_time_in_state_max[j] /
+					(stats->time_in_state_max[j] / 100));
+		}
+	}
+
+	return 0;
+}
+
+PROC_OPS_RO(uclamp_effective_stats);
+
+static int uclamp_util_diff_stats_show(struct seq_file *m, void *v)
+{
+	int i, j, index;
+	struct uclamp_stats *stats;
+
+	seq_puts(m, "V, T(ms), %%\n");
+	for (i = 0; i < pixel_cpu_num; i++) {
+		stats = &per_cpu(uclamp_stats, i);
+		seq_printf(m, "CPU %d - total time: %llu ms\n",
+				 i, stats->total_time / NSEC_PER_MSEC);
+		seq_puts(m, "util_diff_min\n");
+		for (j = 0, index = 0; j < UCLAMP_STATS_SLOTS; j++, index += UCLAMP_STATS_STEP) {
+			seq_printf(m, "%d, %llu, %llu%%\n", index,
+					stats->util_diff_min[j] / NSEC_PER_MSEC,
+					stats->util_diff_min[j] / (stats->total_time / 100));
+		}
+
+		seq_puts(m, "util_diff_max\n");
+		for (j = 0, index = 0; j < UCLAMP_STATS_SLOTS; j++, index -= UCLAMP_STATS_STEP) {
+			seq_printf(m, "%d, %llu, %llu%%\n", index,
+					stats->util_diff_max[j] / NSEC_PER_MSEC,
+					stats->util_diff_max[j] / (stats->total_time / 100));
+		}
+	}
+
+	return 0;
+}
+
+PROC_OPS_RO(uclamp_util_diff_stats);
+
+static ssize_t reset_uclamp_stats_store(struct file *filp,
+							const char __user *ubuf,
+							size_t count, loff_t *pos)
+{
+	bool reset;
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	if (kstrtobool(buf, &reset))
+		return -EINVAL;
+
+	if (reset)
+		reset_uclamp_stats();
+
+	return count;
+}
+
+PROC_OPS_WO(reset_uclamp_stats);
+#endif
+
+/* uclamp filters controls */
+static int uclamp_min_filter_enable_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", static_branch_likely(&uclamp_min_filter_enable) ? 1 : 0);
+	return 0;
+}
+static ssize_t uclamp_min_filter_enable_store(struct file *filp,
+					      const char __user *ubuf,
+					      size_t count, loff_t *pos)
+{
+	int enable = 0;
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	if (kstrtoint(buf, 10, &enable))
+		return -EINVAL;
+
+	if (enable)
+		static_branch_enable(&uclamp_min_filter_enable);
+	else
+		static_branch_disable(&uclamp_min_filter_enable);
+
+	return count;
+}
+PROC_OPS_RW(uclamp_min_filter_enable);
+
+static int uclamp_min_filter_us_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", sysctl_sched_uclamp_min_filter_us);
+	return 0;
+}
+static ssize_t uclamp_min_filter_us_store(struct file *filp,
+					  const char __user *ubuf,
+					  size_t count, loff_t *pos)
+{
+	int val = 0;
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	if (kstrtoint(buf, 10, &val))
+		return -EINVAL;
+
+	sysctl_sched_uclamp_min_filter_us = val;
+	return count;
+}
+PROC_OPS_RW(uclamp_min_filter_us);
+
+static int uclamp_min_filter_rt_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", sysctl_sched_uclamp_min_filter_rt);
+	return 0;
+}
+static ssize_t uclamp_min_filter_rt_store(struct file *filp,
+					  const char __user *ubuf,
+					  size_t count, loff_t *pos)
+{
+	int val = 0;
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	if (kstrtoint(buf, 10, &val))
+		return -EINVAL;
+
+	sysctl_sched_uclamp_min_filter_rt = val;
+	return count;
+}
+PROC_OPS_RW(uclamp_min_filter_rt);
+
+static int uclamp_max_filter_enable_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", static_branch_likely(&uclamp_max_filter_enable) ? 1 : 0);
+	return 0;
+}
+static ssize_t uclamp_max_filter_enable_store(struct file *filp,
+					      const char __user *ubuf,
+					      size_t count, loff_t *pos)
+{
+	int enable = 0;
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	if (kstrtoint(buf, 10, &enable))
+		return -EINVAL;
+
+	if (enable)
+		static_branch_enable(&uclamp_max_filter_enable);
+	else
+		static_branch_disable(&uclamp_max_filter_enable);
+
+	return count;
+}
+PROC_OPS_RW(uclamp_max_filter_enable);
+
+static int uclamp_max_filter_divider_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", sysctl_sched_uclamp_max_filter_divider);
+	return 0;
+}
+static ssize_t uclamp_max_filter_divider_store(struct file *filp,
+					       const char __user *ubuf,
+					       size_t count, loff_t *pos)
+{
+	int val = 0;
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	if (kstrtoint(buf, 10, &val))
+		return -EINVAL;
+
+	sysctl_sched_uclamp_max_filter_divider = val;
+	return count;
+}
+PROC_OPS_RW(uclamp_max_filter_divider);
+
+static int uclamp_max_filter_rt_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", sysctl_sched_uclamp_max_filter_rt);
+	return 0;
+}
+static ssize_t uclamp_max_filter_rt_store(struct file *filp,
+					  const char __user *ubuf,
+					  size_t count, loff_t *pos)
+{
+	int val = 0;
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	if (kstrtoint(buf, 10, &val))
+		return -EINVAL;
+
+	sysctl_sched_uclamp_max_filter_rt = val;
+	return count;
+}
+PROC_OPS_RW(uclamp_max_filter_rt);
+
+static int auto_uclamp_max_show(struct seq_file *m, void *v)
+{
+	int i;
+
+	for (i = 0; i < pixel_cpu_num; i++) {
+		seq_printf(m, "%u ", sched_auto_uclamp_max[SCHED_AUTO_UCLAMP_MAX_TASK][i]);
+	}
+
+	seq_puts(m, "\n");
+
+	return 0;
+}
+static ssize_t auto_uclamp_max_store(struct file *filp,
+				     const char __user *ubuf,
+				     size_t count, loff_t *pos)
+{
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	return update_vendor_tunables(buf, count, SCHED_AUTO_UCLAMP_MAX);
+}
+PROC_OPS_RW(auto_uclamp_max);
+
+static int util_post_init_scale_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", vendor_sched_util_post_init_scale);
+	return 0;
+}
+static ssize_t util_post_init_scale_store(struct file *filp,
+							const char __user *ubuf,
+							size_t count, loff_t *pos)
+{
+	unsigned int val;
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	if (kstrtouint(buf, 0, &val))
+		return -EINVAL;
+
+	if (val > SCHED_CAPACITY_SCALE)
+		return -EINVAL;
+
+	vendor_sched_util_post_init_scale = val;
+
+	return count;
+}
+PROC_OPS_RW(util_post_init_scale);
+
+static int adpf_rampup_multiplier_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%u\n", vendor_sched_adpf_rampup_multiplier);
+	return 0;
+}
+static ssize_t adpf_rampup_multiplier_store(struct file *filp,
+					    const char __user *ubuf,
+					    size_t count, loff_t *pos)
+{
+	unsigned int val;
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	if (kstrtouint(buf, 0, &val))
+		return -EINVAL;
+
+	vendor_sched_adpf_rampup_multiplier = val;
+
+	return count;
+}
+PROC_OPS_RW(adpf_rampup_multiplier);
+
+static int per_task_iowait_boost_max_value_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", sched_per_task_iowait_boost_max_value);
+	return 0;
+}
+static ssize_t per_task_iowait_boost_max_value_store(struct file *filp,
+						     const char __user *ubuf,
+						     size_t count, loff_t *pos)
+{
+	unsigned int val;
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	if (kstrtouint(buf, 0, &val))
+		return -EINVAL;
+
+	if (val > SCHED_CAPACITY_SCALE)
+		return -EINVAL;
+
+	sched_per_task_iowait_boost_max_value = val;
+
+	return count;
+}
+PROC_OPS_RW(per_task_iowait_boost_max_value);
+
+static int per_cpu_iowait_boost_max_value_show(struct seq_file *m, void *v)
+{
+	int i;
+
+	for (i = 0; i < pixel_cpu_num; i++) {
+		seq_printf(m, "%u ", sched_per_cpu_iowait_boost_max_value[i]);
+	}
+
+	seq_puts(m, "\n");
+
+	return 0;
+}
+static ssize_t per_cpu_iowait_boost_max_value_store(struct file *filp,
+						    const char __user *ubuf,
+						    size_t count, loff_t *pos)
+{
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	return update_vendor_tunables(buf, count, SCHED_IOWAIT_BOOST_MAX);
+}
+PROC_OPS_RW(per_cpu_iowait_boost_max_value);
+
+static int pmu_poll_time_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%u\n", pmu_poll_time_ms);
+	return 0;
+}
+
+static ssize_t pmu_poll_time_store(struct file *filp,
+							const char __user *ubuf,
+							size_t count, loff_t *pos)
+{
+	unsigned int val;
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	if (kstrtouint(buf, 0, &val))
+		return -EINVAL;
+
+	if (val < 10 || val > 1000000)
+		return -EINVAL;
+
+	pmu_poll_time_ms = val;
+
+	return count;
+}
+
+PROC_OPS_RW(pmu_poll_time);
+
+static int pmu_poll_enable_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%s\n", pmu_poll_enabled ? "true" : "false");
+	return 0;
+}
+
+static ssize_t pmu_poll_enable_store(struct file *filp,
+							const char __user *ubuf,
+							size_t count, loff_t *pos)
+{
+	bool enable;
+	char buf[MAX_PROC_SIZE];
+	int ret = 0;
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	if (kstrtobool(buf, &enable))
+		return -EINVAL;
+
+	if (enable)
+		ret = pmu_poll_enable();
+	else
+		pmu_poll_disable();
+
+	if (ret)
+		return ret;
+
+	return count;
+}
+
+PROC_OPS_RW(pmu_poll_enable);
+
+static int max_load_balance_interval_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%lu\n", max_load_balance_interval);
+	return 0;
+}
+static ssize_t max_load_balance_interval_store(struct file *filp,
+					       const char __user *ubuf,
+					       size_t count, loff_t *pos)
+{
+	unsigned int val;
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	if (kstrtouint(buf, 0, &val))
+		return -EINVAL;
+
+	vh_sched_max_load_balance_interval = val;
+	max_load_balance_interval = val;
+
+	return count;
+}
+PROC_OPS_RW(max_load_balance_interval);
+
+static int min_granularity_ns_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", sysctl_sched_base_slice);
+	return 0;
+}
+static ssize_t min_granularity_ns_store(struct file *filp,
+					const char __user *ubuf,
+					size_t count, loff_t *pos)
+{
+	unsigned int val;
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	if (kstrtouint(buf, 0, &val))
+		return -EINVAL;
+
+	vh_sched_min_granularity_ns = val;
+	sysctl_sched_base_slice = val;
+
+	return count;
+}
+PROC_OPS_RW(min_granularity_ns);
+
+static int enable_hrtick_show(struct seq_file *m, void *v)
+{
+	bool enabled;
+
+	enabled = static_key_enabled(&sched_feat_keys[__SCHED_FEAT_HRTICK]);
+	seq_printf(m, "%d\n", enabled);
+	return 0;
+}
+static ssize_t enable_hrtick_store(struct file *filp,
+				   const char __user *ubuf,
+				   size_t count, loff_t *pos)
+{
+	unsigned int val;
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	if (kstrtouint(buf, 0, &val))
+		return -EINVAL;
+
+	if (!val) {
+		sysctl_sched_features &= ~(1UL << __SCHED_FEAT_HRTICK);
+		static_key_disable(&sched_feat_keys[__SCHED_FEAT_HRTICK]);
+	} else {
+		sysctl_sched_features |= 1UL << __SCHED_FEAT_HRTICK;
+		static_key_enable(&sched_feat_keys[__SCHED_FEAT_HRTICK]);
+	}
+
+	return count;
+}
+PROC_OPS_RW(enable_hrtick);
+
+static int enable_ptick_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", static_branch_likely(&enable_ptick) ? 1 : 0);
+	return 0;
+}
+static ssize_t enable_ptick_store(struct file *filp,
+				  const char __user *ubuf,
+				  size_t count, loff_t *pos)
+{
+	unsigned int val;
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	if (kstrtouint(buf, 0, &val))
+		return -EINVAL;
+
+	if (!val)
+		static_branch_disable(&enable_ptick);
+	else
+		static_branch_enable(&enable_ptick);
+
+	return count;
+}
+PROC_OPS_RW(enable_ptick);
+
+static int skip_inefficient_opps_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", static_branch_likely(&skip_inefficient_opps_enable) ? 1 : 0);
+	return 0;
+}
+static ssize_t skip_inefficient_opps_store(struct file *filp,
+					   const char __user *ubuf,
+					   size_t count, loff_t *pos)
+{
+	unsigned int val;
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	if (kstrtouint(buf, 0, &val))
+		return -EINVAL;
+
+	if (!val) {
+		static_branch_disable(&skip_inefficient_opps_enable);
+	} else {
+		static_branch_enable(&skip_inefficient_opps_enable);
+	}
+
+	return count;
+}
+PROC_OPS_RW(skip_inefficient_opps);
+
+static int use_em_for_freq_mapping_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", static_branch_likely(&use_em_for_freq_mapping) ? 1 : 0);
+	return 0;
+}
+static ssize_t use_em_for_freq_mapping_store(struct file *filp,
+					     const char __user *ubuf,
+					     size_t count, loff_t *pos)
+{
+	unsigned int val;
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	if (kstrtouint(buf, 0, &val))
+		return -EINVAL;
+
+	if (!val) {
+		static_branch_disable(&use_em_for_freq_mapping);
+	} else {
+		static_branch_enable(&use_em_for_freq_mapping);
+	}
+
+	return count;
+}
+PROC_OPS_RW(use_em_for_freq_mapping);
+
+#if IS_ENABLED(CONFIG_RVH_SCHED_LIB)
+
+static int sched_lib_mask_out_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "0x%lx\n", sched_lib_mask_out_val);
+	return 0;
+}
+
+static ssize_t sched_lib_mask_out_store(struct file *filp,
+					const char __user *ubuf,
+					size_t count, loff_t *pos)
+{
+	unsigned long val = 0;
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	if (kstrtoul(buf, 0, &val))
+		return -EINVAL;
+
+	sched_lib_mask_out_val = val;
+	return count;
+
+}
+
+PROC_OPS_RW(sched_lib_mask_out);
+
+static int sched_lib_mask_in_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "0x%lx\n", sched_lib_mask_in_val);
+	return 0;
+}
+
+static ssize_t sched_lib_mask_in_store(struct file *filp,
+							const char __user *ubuf,
+							size_t count, loff_t *pos)
+{
+	unsigned long val = 0;
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	if (kstrtoul(buf, 0, & val))
+		return -EINVAL;
+
+	sched_lib_mask_in_val = val;
+	return count;
+}
+
+PROC_OPS_RW(sched_lib_mask_in);
+
+extern bool disable_sched_setaffinity;
+static int disable_sched_setaffinity_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", disable_sched_setaffinity);
+	return 0;
+}
+static ssize_t disable_sched_setaffinity_store(struct file *filp,
+						   const char __user *ubuf,
+						   size_t count, loff_t *pos)
+{
+	bool val = 0;
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	if (kstrtobool(buf, &val))
+		return -EINVAL;
+
+	disable_sched_setaffinity = val;
+	if (disable_sched_setaffinity)
+		reset_sched_setaffinity();
+	return count;
+}
+PROC_OPS_RW(disable_sched_setaffinity);
+#endif /* CONFIG_RVH_SCHED_LIB */
+
+#if IS_ENABLED(CONFIG_USE_VENDOR_GROUP_UTIL)
+static int ug_bg_auto_prio_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", vendor_sched_ug_bg_auto_prio);
+	return 0;
+}
+
+static ssize_t ug_bg_auto_prio_store(struct file *filp, const char __user *ubuf,
+				     size_t count, loff_t *pos)
+{
+	int val, err;
+
+	err = kstrtoint_from_user(ubuf, count, 0, &val);
+
+	if (err)
+		return err;
+
+	if (val < MAX_RT_PRIO || val >= MAX_PRIO)
+		return -EINVAL;
+
+	vendor_sched_ug_bg_auto_prio = val;
+
+	return count;
+}
+
+PROC_OPS_RW(ug_bg_auto_prio);
+#endif
+
+static int cpu_skip_mask_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "0x%lx\n", cpu_skip_mask_rt.bits[0]);
+
+	return 0;
+}
+static ssize_t cpu_skip_mask_store(struct file *filp,
+				  const char __user *ubuf,
+				  size_t count, loff_t *pos)
+{
+	int ret;
+	unsigned long val;
+
+	ret = kstrtoul_from_user(ubuf, count, 0, &val);
+	if (ret)
+		return ret;
+
+	cpu_skip_mask_rt.bits[0] = val;
+
+	return count;
+}
+PROC_OPS_RW(cpu_skip_mask);
+
+static int priority_task_name_show(struct seq_file *m, void *v)
+{
+	unsigned long irqflags;
+
+	spin_lock_irqsave(&priority_task_name_lock, irqflags);
+	seq_printf(m, "%s\n", priority_task_name);
+	spin_unlock_irqrestore(&priority_task_name_lock, irqflags);
+	return 0;
+}
+
+/*
+ * Accept multiple partial task names with comma separated
+ */
+static ssize_t priority_task_name_store(struct file *filp, const char __user *ubuf, size_t count,
+					loff_t *ppos)
+{
+	char tmp[sizeof(priority_task_name)];
+	unsigned long irqflags;
+
+	if (count >= sizeof(priority_task_name))
+		return -EINVAL;
+
+	if (copy_from_user(tmp, ubuf, count))
+		return -EFAULT;
+	tmp[count] = '\0';
+
+	spin_lock_irqsave(&priority_task_name_lock, irqflags);
+	strscpy(priority_task_name, tmp, sizeof(priority_task_name));
+	spin_unlock_irqrestore(&priority_task_name_lock, irqflags);
+	return count;
+}
+PROC_OPS_RW(priority_task_name);
+
+static int priority_task_boost_value_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%u\n", vendor_sched_priority_task_boost_value);
+	return 0;
+}
+static ssize_t priority_task_boost_value_store(struct file *filp, const char __user *ubuf,
+					       size_t count, loff_t *pos)
+{
+	unsigned int val;
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	if (kstrtouint(buf, 0, &val))
+		return -EINVAL;
+
+	if (val > SCHED_CAPACITY_SCALE)
+		return -EINVAL;
+
+	vendor_sched_priority_task_boost_value = val;
+
+	return count;
+}
+PROC_OPS_RW(priority_task_boost_value);
+
+static int prefer_idle_task_name_show(struct seq_file *m, void *v)
+{
+
+	spin_lock(&prefer_idle_task_name_lock);
+	seq_printf(m, "%s\n", prefer_idle_task_name);
+	spin_unlock(&prefer_idle_task_name_lock);
+	return 0;
+}
+
+/*
+ * Accept multiple partial task names with comma separated
+ */
+static ssize_t prefer_idle_task_name_store(struct file *filp, const char __user *ubuf, size_t count,
+					   loff_t *ppos)
+{
+	char tmp[sizeof(prefer_idle_task_name)];
+
+	if (count >= sizeof(prefer_idle_task_name))
+		return -EINVAL;
+
+	if (copy_from_user(tmp, ubuf, count))
+		return -EFAULT;
+	tmp[count] = '\0';
+
+	spin_lock(&prefer_idle_task_name_lock);
+	strscpy(prefer_idle_task_name, tmp, sizeof(prefer_idle_task_name));
+	spin_unlock(&prefer_idle_task_name_lock);
+
+	if (set_prefer_idle_task_name())
+		return -EINVAL;
+
+	return count;
+}
+PROC_OPS_RW(prefer_idle_task_name);
+
+/*
+ * Check the type of applications to which the tgid belongs.
+ * normal return values:
+ *   1 : systemui or nexuslauncher related
+ *   2 : chrome related
+ *   -ENOMSG : others
+ *
+ * It's designed intentionally not to return the number of written characters, so it could be used
+ * to check different types of the tgid tasks based on its return value. This helps reducing the
+ * number of syscalls when used frequently in user space.
+ */
+static ssize_t check_tgid_type_store(struct file *filp,
+					const char __user *ubuf,
+					size_t count, loff_t *pos)
+{
+	unsigned int val;
+	char buf[MAX_PROC_SIZE];
+	struct task_struct *p;
+	char tgid_comm[TASK_COMM_LEN] = {0};
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	if (kstrtouint(buf, 0, &val) || val > PID_MAX_LIMIT)
+		return -EINVAL;
+
+	rcu_read_lock();
+	p = find_task_by_vpid(val);
+	if (!p) {
+		rcu_read_unlock();
+		return -ESRCH;
+	}
+
+	get_task_struct(p);
+	if (!check_cred(p)) {
+		put_task_struct(p);
+		rcu_read_unlock();
+		return -EACCES;
+	}
+
+	strscpy(tgid_comm, p->comm, TASK_COMM_LEN);
+	put_task_struct(p);
+	rcu_read_unlock();
+
+	if (strstr(tgid_comm, "systemui") || strstr(tgid_comm, "nexuslauncher")) {
+		return 1;
+	} else if (strstr(tgid_comm, "android.chrome") || strstr(tgid_comm, "ileged_process")) {
+		return 2;
+	} else {
+		return -ENOMSG;
+	}
+}
+PROC_OPS_WO(check_tgid_type);
+
+static int boost_at_fork_task_name_show(struct seq_file *m, void *v)
+{
+	unsigned long irqflags;
+
+	raw_spin_lock_irqsave(&boost_at_fork_task_name_lock, irqflags);
+	seq_printf(m, "%s\n", boost_at_fork_task_name);
+	raw_spin_unlock_irqrestore(&boost_at_fork_task_name_lock, irqflags);
+	return 0;
+}
+
+/*
+ * Accepts a single value only.
+ */
+static ssize_t boost_at_fork_task_name_store(struct file *filp, const char __user *ubuf,
+					     size_t count, loff_t *ppos)
+{
+	char tmp[sizeof(boost_at_fork_task_name)];
+	unsigned long irqflags;
+
+	if (count >= sizeof(boost_at_fork_task_name))
+		return -EINVAL;
+
+	if (copy_from_user(tmp, ubuf, count))
+		return -EFAULT;
+	tmp[count] = '\0';
+
+	raw_spin_lock_irqsave(&boost_at_fork_task_name_lock, irqflags);
+	strscpy(boost_at_fork_task_name, tmp, sizeof(boost_at_fork_task_name));
+	raw_spin_unlock_irqrestore(&boost_at_fork_task_name_lock, irqflags);
+	return count;
+}
+PROC_OPS_RW(boost_at_fork_task_name);
+
+static int boost_at_fork_value_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%lu\n", vendor_sched_boost_at_fork_value);
+	return 0;
+}
+static ssize_t boost_at_fork_value_store(struct file *filp,
+					 const char __user *ubuf,
+					 size_t count, loff_t *pos)
+{
+	unsigned int val;
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	if (kstrtouint(buf, 0, &val))
+		return -EINVAL;
+
+	if (val > SCHED_CAPACITY_SCALE)
+		return -EINVAL;
+
+	vendor_sched_boost_at_fork_value = val;
+
+	return count;
+}
+PROC_OPS_RW(boost_at_fork_value);
+
+static int boost_at_fork_duration_show(struct seq_file *m, void *v)
+{
+	/* Change from nanosecond to millisecond. */
+	seq_printf(m, "%lu\n", vendor_sched_boost_at_fork_duration / 1000000);
+	return 0;
+}
+static ssize_t boost_at_fork_duration_store(struct file *filp,
+					    const char __user *ubuf,
+					    size_t count, loff_t *pos)
+{
+	unsigned long val;
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	if (kstrtoul(buf, 0, &val))
+		return -EINVAL;
+
+	/* Change from millisecond to nanosecond. */
+	vendor_sched_boost_at_fork_duration = val * 1000000;
+
+	return count;
+}
+PROC_OPS_RW(boost_at_fork_duration);
+
+static ssize_t adpf_adjustment_store(struct file *filp,
+				  const char __user *ubuf,
+				  size_t count, loff_t *pos)
+{
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	return update_sched_adpf_adjustment(buf, count);
+}
+PROC_OPS_WO(adpf_adjustment);
+
+static int suspend_resume_boost_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%u\n", vendor_sched_suspend_resume_boost);
+	return 0;
+}
+static ssize_t suspend_resume_boost_store(struct file *filp, const char __user *ubuf,
+					  size_t count, loff_t *pos)
+{
+	unsigned int val;
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	if (kstrtouint(buf, 0, &val))
+		return -EINVAL;
+
+	vendor_sched_suspend_resume_boost = val;
+
+	return count;
+}
+PROC_OPS_RW(suspend_resume_boost);
+
+static int sched_group_tracker_rate_limit_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%u\n", sched_group_tracker_rate_limit);
+	return 0;
+}
+static ssize_t sched_group_tracker_rate_limit_store(struct file *filp,
+						    const char __user *ubuf,
+						    size_t count, loff_t *pos)
+{
+	unsigned int val;
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	if (kstrtouint(buf, 0, &val))
+		return -EINVAL;
+
+	if (!val)
+		return -EINVAL;
+
+	sched_group_tracker_rate_limit = val;
+
+	return count;
+}
+PROC_OPS_RW(sched_group_tracker_rate_limit);
+
+static int task_placement_retry_count_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", vendor_sched_task_placement_retry_count);
+	return 0;
+}
+static ssize_t task_placement_retry_count_store(struct file *filp,
+						const char __user *ubuf,
+						size_t count, loff_t *pos)
+{
+	int val;
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	if (kstrtoint(buf, 0, &val))
+		return -EINVAL;
+
+	vendor_sched_task_placement_retry_count = val;
+
+	return count;
+}
+PROC_OPS_RW(task_placement_retry_count);
+
+static int task_placement_retry_delay_us_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", vendor_sched_task_placement_retry_delay_us);
+	return 0;
+}
+static ssize_t task_placement_retry_delay_us_store(struct file *filp,
+						   const char __user *ubuf,
+						   size_t count, loff_t *pos)
+{
+	int val;
+	char buf[MAX_PROC_SIZE];
+
+	if (count >= sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(buf, ubuf, count))
+		return -EFAULT;
+
+	buf[count] = '\0';
+
+	if (kstrtoint(buf, 0, &val))
+		return -EINVAL;
+
+	vendor_sched_task_placement_retry_delay_us = val;
+
+	return count;
+}
+PROC_OPS_RW(task_placement_retry_delay_us);
+
+#define DEFINE_STATIC_KEY_PROC_RW(name)	\
+static int name##_show(struct seq_file *m, void *v)	\
+{	\
+	seq_printf(m, "%d\n", static_branch_likely(&name) ? 1 : 0);	\
+	return 0;	\
+}	\
+static ssize_t name##_store(struct file *filp,	\
+		const char __user *ubuf, size_t count, loff_t *pos) \
+{	\
+	unsigned int val;	\
+	char buf[MAX_PROC_SIZE];	\
+	\
+	if (count >= sizeof(buf))	\
+		return -EINVAL;	\
+	\
+	if (copy_from_user(buf, ubuf, count))	\
+		return -EFAULT;	\
+	\
+	buf[count] = '\0';	\
+	\
+	if (kstrtouint(buf, 0, &val))	\
+		return -EINVAL;	\
+	\
+	if (!val)	\
+		static_branch_disable(&name);	\
+	else	\
+		static_branch_enable(&name);	\
+	\
+	return count;	\
+}	\
+PROC_OPS_RW(name)
+
+DEFINE_STATIC_KEY_PROC_RW(dsulat_fast_switch_enable);
+DEFINE_STATIC_KEY_PROC_RW(memlat_fast_switch_enable);
+
+struct pentry {
+	const char *name;
+	enum vendor_procfs_type type;
+	/*
+	 * Vendor group the procfs belongs to.
+	 *  -1 if it doesn't follow into any group.
+	 */
+	const int vg;
+	const struct proc_ops *fops;
+};
+static struct pentry entries[] = {
+	PROC_GROUP_ENTRIES(sys, VG_SYSTEM),
+	PROC_GROUP_ENTRIES(ta, VG_TOPAPP),
+	PROC_GROUP_ENTRIES(fg, VG_FOREGROUND),
+	PROC_GROUP_ENTRIES(cam, VG_CAMERA),
+	PROC_GROUP_ENTRIES(cam_power, VG_CAMERA_POWER),
+	PROC_GROUP_ENTRIES(bg, VG_BACKGROUND),
+	PROC_GROUP_ENTRIES(sysbg, VG_SYSTEM_BACKGROUND),
+	PROC_GROUP_ENTRIES(nnapi, VG_NNAPI_HAL),
+	PROC_GROUP_ENTRIES(rt, VG_RT),
+	PROC_GROUP_ENTRIES(dex2oat, VG_DEX2OAT),
+	PROC_GROUP_ENTRIES(ota, VG_OTA),
+	PROC_GROUP_ENTRIES(sf, VG_SF),
+	PROC_GROUP_ENTRIES(fg_wi, VG_FOREGROUND_WINDOW),
+	// sched qos attributes
+	PROC_SCHED_QOS_ENTRY(boost_prio_set),
+	PROC_SCHED_QOS_ENTRY(boost_prio_clear),
+	PROC_SCHED_QOS_ENTRY(prefer_fit_set),
+	PROC_SCHED_QOS_ENTRY(prefer_fit_clear),
+	PROC_SCHED_QOS_ENTRY(prefer_idle_set),
+	PROC_SCHED_QOS_ENTRY(prefer_idle_clear),
+	PROC_SCHED_QOS_ENTRY(adpf_set),
+	PROC_SCHED_QOS_ENTRY(adpf_clear),
+	PROC_SCHED_QOS_ENTRY(preempt_wakeup_set),
+	PROC_SCHED_QOS_ENTRY(preempt_wakeup_clear),
+	PROC_SCHED_QOS_ENTRY(auto_uclamp_max_set),
+	PROC_SCHED_QOS_ENTRY(auto_uclamp_max_clear),
+	PROC_SCHED_QOS_ENTRY(prefer_high_cap_set),
+	PROC_SCHED_QOS_ENTRY(prefer_high_cap_clear),
+	PROC_SCHED_QOS_ENTRY(rampup_multiplier_set),
+	PROC_SCHED_QOS_ENTRY(rampup_multiplier_clear),
+	PROC_SCHED_QOS_ENTRY(tag_nice_set),
+	PROC_SCHED_QOS_ENTRY(tag_nice_clear),
+	PROC_SCHED_QOS_ENTRY(sched_qos_none),
+	PROC_SCHED_QOS_ENTRY(sched_qos_power_efficiency),
+	PROC_SCHED_QOS_ENTRY(sched_qos_sensitive_standard),
+	PROC_SCHED_QOS_ENTRY(sched_qos_sensitive_high),
+	PROC_SCHED_QOS_ENTRY(sched_qos_sensitive_extreme),
+#if IS_ENABLED(CONFIG_USE_VENDOR_GROUP_UTIL)
+	// FG util group attributes
+#if IS_ENABLED(CONFIG_USE_GROUP_THROTTLE)
+	PROC_ENTRY(ug_fg_group_throttle),
+#endif
+	PROC_ENTRY(ug_fg_uclamp_min),
+	PROC_ENTRY(ug_fg_uclamp_max),
+	// BG util group attributes
+#if IS_ENABLED(CONFIG_USE_GROUP_THROTTLE)
+	PROC_ENTRY(ug_bg_group_throttle),
+#endif
+	PROC_ENTRY(ug_bg_uclamp_min),
+	PROC_ENTRY(ug_bg_uclamp_max),
+	PROC_ENTRY(ug_bg_auto_prio),
+#endif
+	// Uclamp stats
+#if IS_ENABLED(CONFIG_UCLAMP_STATS)
+	PROC_ENTRY(uclamp_stats),
+	PROC_ENTRY(uclamp_effective_stats),
+	PROC_ENTRY(uclamp_util_diff_stats),
+	PROC_ENTRY(reset_uclamp_stats),
+#endif
+	PROC_ENTRY(util_threshold),
+	PROC_ENTRY(thermal_cap_margin),
+	PROC_ENTRY(auto_uclamp_max_st),
+	PROC_ENTRY(auto_uclamp_max_st_util_threshold),
+	PROC_ENTRY(util_post_init_scale),
+	PROC_ENTRY(npi_packing),
+	PROC_ENTRY(reduce_prefer_idle),
+	PROC_ENTRY(auto_prefer_idle),
+	PROC_ENTRY(dump_task),
+	PROC_ENTRY(pmu_stats),
+	// pmu limit attribute
+	PROC_ENTRY(pmu_poll_time),
+	PROC_ENTRY(pmu_poll_enable),
+#if IS_ENABLED(CONFIG_RVH_SCHED_LIB)
+	// sched lib
+	PROC_ENTRY(sched_lib_mask_out),
+	PROC_ENTRY(sched_lib_mask_in),
+	PROC_ENTRY(disable_sched_setaffinity),
+#endif /* CONFIG_RVH_SCHED_LIB */
+	// uclamp filter
+	PROC_ENTRY(uclamp_min_filter_enable),
+	PROC_ENTRY(uclamp_min_filter_us),
+	PROC_ENTRY(uclamp_min_filter_rt),
+	PROC_ENTRY(uclamp_max_filter_enable),
+	PROC_ENTRY(uclamp_max_filter_divider),
+	PROC_ENTRY(uclamp_max_filter_rt),
+	PROC_ENTRY(auto_uclamp_max),
+	PROC_ENTRY(adpf_adjustment),
+	// dvfs headroom
+	PROC_ENTRY(dvfs_headroom),
+	PROC_ENTRY(tapered_dvfs_headroom_enable),
+	PROC_ENTRY(auto_dvfs_headroom_enable),
+	PROC_ENTRY(response_time_ms_fix_enable),
+	PROC_ENTRY(adpf_rampup_multiplier),
+	PROC_ENTRY(update_freq_on_idle_enable),
+	// iowait boost
+	PROC_ENTRY(per_task_iowait_boost_max_value),
+	PROC_ENTRY(per_cpu_iowait_boost_max_value),
+	// load balance
+	PROC_ENTRY(max_load_balance_interval),
+	PROC_ENTRY(min_granularity_ns),
+	PROC_ENTRY(enable_hrtick),
+	PROC_ENTRY(enable_ptick),
+	// auto migration margins
+	PROC_ENTRY(auto_migration_margins_enable),
+	// pixel_em
+	PROC_ENTRY(skip_inefficient_opps),
+	PROC_ENTRY(use_em_for_freq_mapping),
+	// skip mask for RT wake up
+	PROC_ENTRY(cpu_skip_mask),
+	// skip mask for prefer prev cpu
+	PROC_ENTRY(skip_prefer_prev_mask),
+	// names for the priority task
+	PROC_ENTRY(priority_task_name),
+	// boost value for the priority task
+	PROC_ENTRY(priority_task_boost_value),
+	// names for the prefer_idle task
+	PROC_ENTRY(prefer_idle_task_name),
+	/* boost at fork */
+	PROC_ENTRY(boost_at_fork_task_name),
+	PROC_ENTRY(boost_at_fork_value),
+	PROC_ENTRY(boost_at_fork_duration),
+	// check the type of application to which the tgid belongs
+	PROC_ENTRY(check_tgid_type),
+	PROC_ENTRY(suspend_resume_boost),
+	// per-task memory aware
+	PROC_ENTRY(per_task_memory_aware_enable),
+	PROC_ENTRY(eas_fork_exec_enable),
+	PROC_ENTRY(memory_capacity),
+	// sched group tracker
+	PROC_ENTRY(sched_group_tracker_rate_limit),
+	PROC_ENTRY(dsulat_fast_switch_enable),
+	PROC_ENTRY(memlat_fast_switch_enable),
+	// task placement retry
+	PROC_ENTRY(task_placement_retry_count),
+	PROC_ENTRY(task_placement_retry_delay_us),
+};
+
+
+int create_procfs_node(void)
+{
+	int i;
+	struct uclamp_se uc_max = {};
+	enum uclamp_id clamp_id;
+	struct proc_dir_entry *parent_directory;
+	struct proc_dir_entry *group_root_dir;
+	struct proc_dir_entry *sched_qos_dir;
+
+	/* create vendor sched root directory */
+	vendor_sched = proc_mkdir("vendor_sched", NULL);
+	if (!vendor_sched)
+		return -ENOMEM;
+
+	/* create vendor group directories */
+	group_root_dir = proc_mkdir("groups", vendor_sched);
+	if (!group_root_dir)
+		goto out;
+
+	/* create sched qos directory */
+	sched_qos_dir = proc_mkdir("sched_qos", vendor_sched);
+	if (!sched_qos_dir)
+		goto out;
+
+	for (i = 0; i < VG_MAX; i++) {
+		group_dirs[i] = proc_mkdir(GRP_NAME[i], group_root_dir);
+		if (!group_dirs[i]) {
+			goto out;
+		}
+	}
+
+	/* create procfs */
+	for (i = 0; i < ARRAY_SIZE(entries); i++) {
+		umode_t mode;
+
+		if (entries[i].fops->proc_write == NULL) {
+			mode = 0444;
+		} else if(entries[i].fops->proc_read== NULL) {
+			mode = 0200;
+		} else {
+			mode = 0644;
+		}
+
+		if (entries[i].type == GROUPED_CONTROL) {
+			if (entries[i].vg >= 0 && entries[i].vg < VG_MAX) {
+				parent_directory = group_dirs[entries[i].vg];
+			} else {
+				parent_directory = group_root_dir;
+			}
+		} else if (entries[i].type == SCHED_QOS_CONTROL) {
+			parent_directory = sched_qos_dir;
+		} else {
+			parent_directory = vendor_sched;
+		}
+
+		if (!proc_create(entries[i].name, mode,
+					parent_directory, entries[i].fops)) {
+			pr_debug("%s(), create %s failed\n",
+					__func__, entries[i].name);
+
+			goto out;
+		}
+	}
+
+	uc_max.value = uclamp_none(UCLAMP_MAX);
+	uc_max.bucket_id = get_bucket_id(uc_max.value);
+	uc_max.user_defined = false;
+	for (clamp_id = 0; clamp_id < UCLAMP_CNT; clamp_id++) {
+		uclamp_default[clamp_id] = uc_max;
+	}
+
+	initialize_vendor_group_property();
+
+	if (genl_register_family(&vendor_sched_gnl_family) != 0)
+		pr_warn("failed to register vendor sched genl family\n");
+
+	return 0;
+
+out:
+	remove_proc_subtree("vendor_sched", NULL);
+	return -ENOMEM;
+}
+
+MODULE_IMPORT_NS(IDLE_INJECT);
