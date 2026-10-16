@@ -776,44 +776,29 @@ static void sugov_deferred_update(struct sugov_policy *sg_policy)
  * cpufreq driver limitations.
  */
 static unsigned int get_next_freq(struct sugov_policy *sg_policy,
-                  unsigned long util, unsigned long max)
+				  unsigned long util, unsigned long max)
 {
-    struct cpufreq_policy *policy = sg_policy->policy;
-    unsigned int freq = policy->cpuinfo.max_freq;
-    unsigned long capacity = arch_scale_cpu_capacity(policy->cpu);
+	struct cpufreq_policy *policy = sg_policy->policy;
+	unsigned int freq = policy->cpuinfo.max_freq;
 
-    /* 
-     * PRIME CORE HARD UTILIZATION CAP (3.57 GHz)
-     * In the Tensor G6 Energy Model, 3571000 kHz maps to 1020 capacity. 
-     * Clamping the utilization integer for the prime core (capacity 1024) 
-     * forces the governor to discard the 4 highest OPPs.
-     * Little and Mid clusters remain uncapped.
-     */
-    if (capacity == SCHED_CAPACITY_SCALE) {
-        if (util > 1020) {
-            util = 1020;
-        }
-    }
+	freq = map_util_freq_pixel_mod(util, freq, max, policy->cpu);
+	trace_sugov_next_freq(policy->cpu, util, max, freq);
 
-    /* The governor maps our clamped utilization against the Energy Model */
-    freq = map_util_freq_pixel_mod(util, freq, max, policy->cpu);
-    trace_sugov_next_freq(policy->cpu, util, max, freq);
+	if (freq == sg_policy->cached_raw_freq && !sg_policy->need_freq_update)
+		return sg_policy->next_freq;
 
-    if (freq == sg_policy->cached_raw_freq && !sg_policy->need_freq_update)
-        return sg_policy->next_freq;
+	sg_policy->prev_cached_raw_freq = sg_policy->cached_raw_freq;
+	sg_policy->cached_raw_freq = freq;
 
-    sg_policy->prev_cached_raw_freq = sg_policy->cached_raw_freq;
-    sg_policy->cached_raw_freq = freq;
+	/* Workaround a bug so that we can ignore efficiencies_available */
+	policy->efficiencies_available = false;
 
-    /* Workaround so that we can ignore efficiencies_available */
-    policy->efficiencies_available = false;
+	freq = cpufreq_driver_resolve_freq(policy, freq);
 
-    freq = cpufreq_driver_resolve_freq(policy, freq);
+	/* Workaround a bug in GKI where we can escape policy limits */
+	freq = clamp_val(freq, policy->min, policy->max);
 
-    /* Workaround a bug in GKI where we can escape policy limits */
-    freq = clamp_val(freq, policy->min, policy->max);
-
-    return freq;
+	return freq;
 }
 
 /*
