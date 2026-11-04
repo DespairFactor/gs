@@ -762,9 +762,26 @@ static unsigned int get_next_freq(struct sugov_policy *sg_policy,
 {
 	struct cpufreq_policy *policy = sg_policy->policy;
 	unsigned int freq = policy->cpuinfo.max_freq;
+	unsigned int delta_freq;
 
 	freq = map_util_freq_pixel_mod(util, freq, max, policy->cpu);
 	trace_sugov_next_freq(policy->cpu, util, max, freq);
+
+	/* 
+	 * OPTIMIZATION: Frequency Hysteresis Deadband
+	 * If the system is fully running and the new target frequency is extremely 
+	 * close to the existing active frequency (< 1.5% variance), bypass 
+	 * redundant driver writes to eliminate PLL micro-jitter overhead.
+	 */
+	if (likely(system_state >= SYSTEM_RUNNING && sg_policy->next_freq > 0) &&
+	    !sg_policy->need_freq_update) {
+		delta_freq = (freq > sg_policy->next_freq) ? 
+			     (freq - sg_policy->next_freq) : 
+			     (sg_policy->next_freq - freq);
+
+		if (delta_freq < (policy->cpuinfo.max_freq / 64))
+			return sg_policy->next_freq;
+	}
 
 	if (freq == sg_policy->cached_raw_freq && !sg_policy->need_freq_update)
 		return sg_policy->next_freq;
