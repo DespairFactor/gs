@@ -660,8 +660,15 @@ static bool sugov_up_down_rate_limit(struct sugov_policy *sg_policy, u64 time,
 		}
 
 		comp = sg_policy->down_rate_delay_ns * next_freq;
-		for (i = 0; i < sg_policy->down_rate_limit_scale_pow - 1; i++) {
-			comp = comp / sg_policy->next_freq * next_freq;
+		/* 
+		 * OPTIMIZATION: Down-Rate Scale Power Fast-Path Pruning
+		 * If down_rate_limit_scale_pow is at its default value of 1, 
+		 * bypass the scaling factor calculation loop entirely.
+		 */
+		if (likely(sg_policy->down_rate_limit_scale_pow > 1)) {
+			for (i = 0; i < sg_policy->down_rate_limit_scale_pow - 1; i++) {
+				comp = comp / sg_policy->next_freq * next_freq;
+			}
 		}
 		if (delta_ns * sg_policy->next_freq < comp)
 			return true;
