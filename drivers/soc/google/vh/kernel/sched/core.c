@@ -366,12 +366,14 @@ void vh_sched_switch_pixel_mod(void *data, bool preempt, struct task_struct *pre
 	if (static_branch_likely(&update_freq_on_idle_enable) && !in_suspend_resume)
 		force_cpufreq_update = is_idle_task(next) || is_idle_task(prev);
 
-	if (task_is_running(prev)) {
-		__update_util_est_invariance(rq, prev, rq->nr_running > 1);
-		force_cpufreq_update |= update_auto_max_uclamp_st(prev);
-	}
+	if (static_branch_likely(&auto_dvfs_headroom_enable)) {
+        if (task_is_running(prev)) {
+            __update_util_est_invariance(rq, prev, rq->nr_running > 1);
+            force_cpufreq_update |= update_auto_max_uclamp_st(prev);
+        }
 
-	force_cpufreq_update |= update_auto_max_uclamp_st(next);
+        force_cpufreq_update |= update_auto_max_uclamp_st(next);
+    }
 
 	if (force_cpufreq_update) {
 		/* freq may have been updated in set/put task, so use force update here */
