@@ -237,43 +237,53 @@ u64 approximate_runtime(unsigned long util)
 static inline u64
 scale_mem_stall_preasure(u64 delta, struct vendor_task_struct *vp, int cpu)
 {
-	u64 cycle_delta = vp->mp_stats.mp.current_cycle - vp->mp_stats.mp.last_cycle;
-	u64 stall_delta = vp->mp_stats.mp.current_stall - vp->mp_stats.mp.last_stall;
-	int cluster = pixel_cpu_to_cluster[cpu];
+    u64 cycle_delta = vp->mp_stats.mp.current_cycle - vp->mp_stats.mp.last_cycle;
+    u64 stall_delta = vp->mp_stats.mp.current_stall - vp->mp_stats.mp.last_stall;
+    int cluster = pixel_cpu_to_cluster[cpu];
 
-	/* This does happen occasionally for unknown reason. */
-	if (cycle_delta >= stall_delta)
-		return delta * stall_delta / cycle_delta;
+    /* 
+     * OPTIMIZATION & SAFETY: Zero-Delta Division Guard
+     */
+    if (unlikely(!cycle_delta))
+        goto fallback;
 
-	/* Fallback approach if cycle_delta < stall_delta */
-	if (vp->mp_stats.pmu_stats.cycle[cluster])
-		return delta * vp->mp_stats.pmu_stats.stall[cluster] /
-			vp->mp_stats.pmu_stats.cycle[cluster];
+    if (cycle_delta >= stall_delta)
+        return delta * stall_delta / cycle_delta;
 
-	return 0;
+fallback:
+    if (vp->mp_stats.pmu_stats.cycle[cluster])
+        return delta * vp->mp_stats.pmu_stats.stall[cluster] /
+            vp->mp_stats.pmu_stats.cycle[cluster];
+
+    return 0;
 }
 
 static inline u64
 scale_mem_access_preasure(u64 delta, struct vendor_task_struct *vp)
 {
-	u64 inst_delta = vp->mp_stats.mp.current_inst - vp->mp_stats.mp.last_inst;
-	u64 mem_rd_inst_delta = vp->mp_stats.mp.current_mem_rd_inst -
-				vp->mp_stats.mp.last_mem_rd_inst;
-	u64 mem_wr_inst_delta = vp->mp_stats.mp.current_mem_wr_inst -
-				vp->mp_stats.mp.last_mem_wr_inst;
-	u64 mem_access_inst_delta = mem_rd_inst_delta + mem_wr_inst_delta;
+    u64 inst_delta = vp->mp_stats.mp.current_inst - vp->mp_stats.mp.last_inst;
+    u64 mem_rd_inst_delta = vp->mp_stats.mp.current_mem_rd_inst -
+                vp->mp_stats.mp.last_mem_rd_inst;
+    u64 mem_wr_inst_delta = vp->mp_stats.mp.current_mem_wr_inst -
+                vp->mp_stats.mp.last_mem_wr_inst;
+    u64 mem_access_inst_delta = mem_rd_inst_delta + mem_wr_inst_delta;
 
-	/* This does happen occasionally for unknown reason. */
-	if (inst_delta >= mem_access_inst_delta)
-		return delta * mem_access_inst_delta / inst_delta;
+    /* 
+     * OPTIMIZATION & SAFETY: Zero-Delta Division Guard
+     */
+    if (unlikely(!inst_delta))
+        goto fallback;
 
-	/* Fallback approach if inst_delta < mem_access_inst_delta */
-	if (vp->mp_stats.pmu_stats.total_inst)
-		return delta * (vp->mp_stats.pmu_stats.total_mem_rd_inst +
-			vp->mp_stats.pmu_stats.total_mem_wr_inst) /
-			vp->mp_stats.pmu_stats.total_inst;
+    if (inst_delta >= mem_access_inst_delta)
+        return delta * mem_access_inst_delta / inst_delta;
 
-	return 0;
+fallback:
+    if (vp->mp_stats.pmu_stats.total_inst)
+        return delta * (vp->mp_stats.pmu_stats.total_mem_rd_inst +
+            vp->mp_stats.pmu_stats.total_mem_wr_inst) /
+            vp->mp_stats.pmu_stats.total_inst;
+
+    return 0;
 }
 
 static __always_inline u32
