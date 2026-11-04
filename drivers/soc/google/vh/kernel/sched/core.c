@@ -524,85 +524,103 @@ static void set_adpf_inheritance(struct task_struct *p, unsigned int type, int v
 }
 
 static void set_performance_inheritance(struct task_struct *p, struct task_struct *pi_task,
-	unsigned int type)
+    unsigned int type)
 {
-	struct vendor_inheritance_struct *vi = get_vendor_inheritance_struct(p);
-	struct rq_flags rf;
-	struct rq *rq;
+    struct vendor_inheritance_struct *vi = get_vendor_inheritance_struct(p);
+    struct rq_flags rf;
+    struct rq *rq;
 
-	/* RT mutex in GKI path already held pi_lock so we only hold rq lock in vendor hook */
-	if (type == VI_RTMUTEX)
-		rq = __task_rq_lock(p, &rf);
-	else
-		rq = task_rq_lock(p, &rf);
+    /* 
+     * OPTIMIZATION: Early Exit for Redundant Resets
+     * If restoring priority (pi_task == NULL) and no inheritance flags 
+     * or custom uclamp values are currently active for this type, 
+     * bypass rq lock acquisition and recalculation entirely.
+     */
+    if (!pi_task) {
+        bool has_inheritance = (vi->uclamp[type][UCLAMP_MIN] != uclamp_none(UCLAMP_MIN)) ||
+                               (vi->uclamp[type][UCLAMP_MAX] != uclamp_none(UCLAMP_MAX)) ||
+                               (vi->adpf & (1 << type)) ||
+                               (vi->prefer_idle & (1 << type)) ||
+                               (vi->prefer_fit & (1 << type)) ||
+                               (vi->preempt_wakeup & (1 << type)) ||
+                               (vi->prefer_high_cap & (1 << type));
+        if (!has_inheritance)
+            return;
+    }
 
-	lockdep_assert_held(&p->pi_lock);
+    /* RT mutex in GKI path already held pi_lock so we only hold rq lock in vendor hook */
+    if (type == VI_RTMUTEX)
+        rq = __task_rq_lock(p, &rf);
+    else
+        rq = task_rq_lock(p, &rf);
 
-	if (pi_task) {
-		unsigned long p_util = task_util(p);
-		unsigned long p_uclamp_min = uclamp_eff_value_pixel_mod(p, UCLAMP_MIN);
-		unsigned long p_uclamp_max = uclamp_eff_value_pixel_mod(p, UCLAMP_MAX);
-		unsigned long pi_util = task_util(pi_task);
-		unsigned long pi_uclamp_min = uclamp_eff_value_pixel_mod(pi_task, UCLAMP_MIN);
-		unsigned long pi_uclamp_max = uclamp_eff_value_pixel_mod(pi_task, UCLAMP_MAX);
+    lockdep_assert_held(&p->pi_lock);
 
-		/*
-		 * Take task's util into consideration first to do full
-		 * performance inheritance.
-		 *
-		 * If pi_uclamp_min = 612 but pi_util is 812, then setting
-		 * p_uclamp_min to 612 is not enough as the task will still run
-		 * slower.
-		 *
-		 * Or if pi_uclamp_min is 0 but pi_util is 800 while p_util is
-		 * 100, then pi_task could wait for longer to acquire the lock
-		 * because the performance of p is too low.
-		 */
-		p_uclamp_min = clamp(p_util, p_uclamp_min, p_uclamp_max);
-		pi_uclamp_min = clamp(pi_util, pi_uclamp_min, pi_uclamp_max);
+    if (pi_task) {
+        unsigned long p_util = task_util(p);
+        unsigned long p_uclamp_min = uclamp_eff_value_pixel_mod(p, UCLAMP_MIN);
+        unsigned long p_uclamp_max = uclamp_eff_value_pixel_mod(p, UCLAMP_MAX);
+        unsigned long pi_util = task_util(pi_task);
+        unsigned long pi_uclamp_min = uclamp_eff_value_pixel_mod(pi_task, UCLAMP_MIN);
+        unsigned long pi_uclamp_max = uclamp_eff_value_pixel_mod(pi_task, UCLAMP_MAX);
 
-		/* Inherit unclamp_min/max if they're inverted */
+        /*
+         * Take task's util into consideration first to do full
+         * performance inheritance.
+         *
+         * If pi_uclamp_min = 612 but pi_util is 812, then setting
+         * p_uclamp_min to 612 is not enough as the task will still run
+         * slower.
+         *
+         * Or if pi_uclamp_min is 0 but pi_util is 800 while p_util is
+         * 100, then pi_task could wait for longer to acquire the lock
+         * because the performance of p is too low.
+         */
+        p_uclamp_min = clamp(p_util, p_uclamp_min, p_uclamp_max);
+        pi_uclamp_min = clamp(pi_util, pi_uclamp_min, pi_uclamp_max);
 
-		if (p_uclamp_min < pi_uclamp_min)
-			vi->uclamp[type][UCLAMP_MIN] = pi_uclamp_min;
+        /* Inherit unclamp_min/max if they're inverted */
 
-		if (p_uclamp_max < pi_uclamp_max || pi_uclamp_min > p_uclamp_max)
-			vi->uclamp[type][UCLAMP_MAX] = pi_uclamp_max;
+        if (p_uclamp_min < pi_uclamp_min)
+            vi->uclamp[type][UCLAMP_MIN] = pi_uclamp_min;
 
-		if (!!get_adpf(pi_task, true))
-			set_adpf_inheritance(p, type, 1);
+        if (p_uclamp_max < pi_uclamp_max || pi_uclamp_min > p_uclamp_max)
+            vi->uclamp[type][UCLAMP_MAX] = pi_uclamp_max;
 
-		if (!!get_prefer_idle(pi_task))
-			vi_set_prefer_idle(vi, type, 1);
+        if (!!get_adpf(pi_task, true))
+            set_adpf_inheritance(p, type, 1);
 
-		if (!!get_prefer_fit(pi_task))
-			vi_set_prefer_fit(vi, type, 1);
+        if (!!get_prefer_idle(pi_task))
+            vi_set_prefer_idle(vi, type, 1);
 
-		if (!!get_preempt_wakeup(pi_task))
-			vi_set_preempt_wakeup(vi, type, 1);
+        if (!!get_prefer_fit(pi_task))
+            vi_set_prefer_fit(vi, type, 1);
 
-		if (get_prefer_high_cap(pi_task) ||
-			task_cpu(pi_task) >= pixel_cluster_start_cpu[1])
-			vi_set_prefer_high_cap(vi, type, 1);
-	} else {
-		vi->uclamp[type][UCLAMP_MIN] = uclamp_none(UCLAMP_MIN);
-		vi->uclamp[type][UCLAMP_MAX] = uclamp_none(UCLAMP_MAX);
+        if (!!get_preempt_wakeup(pi_task))
+            vi_set_preempt_wakeup(vi, type, 1);
 
-		set_adpf_inheritance(p, type, 0);
+        if (get_prefer_high_cap(pi_task) ||
+            task_cpu(pi_task) >= pixel_cluster_start_cpu[1])
+            vi_set_prefer_high_cap(vi, type, 1);
+    } else {
+        vi->uclamp[type][UCLAMP_MIN] = uclamp_none(UCLAMP_MIN);
+        vi->uclamp[type][UCLAMP_MAX] = uclamp_none(UCLAMP_MAX);
 
-		vi_set_prefer_idle(vi, type, 0);
+        set_adpf_inheritance(p, type, 0);
 
-		vi_set_prefer_fit(vi, type, 0);
+        vi_set_prefer_idle(vi, type, 0);
 
-		vi_set_preempt_wakeup(vi, type, 0);
+        vi_set_prefer_fit(vi, type, 0);
 
-		vi_set_prefer_high_cap(vi, type, 0);
-	}
+        vi_set_preempt_wakeup(vi, type, 0);
 
-	if (type == VI_RTMUTEX)
-		__task_rq_unlock(rq, &rf);
-	else
-		task_rq_unlock(rq, p, &rf);
+        vi_set_prefer_high_cap(vi, type, 0);
+    }
+
+    if (type == VI_RTMUTEX)
+        __task_rq_unlock(rq, &rf);
+    else
+        task_rq_unlock(rq, p, &rf);
 }
 
 void vh_binder_set_priority_pixel_mod(void *data, struct binder_transaction *t,
