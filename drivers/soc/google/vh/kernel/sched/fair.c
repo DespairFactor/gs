@@ -2851,92 +2851,99 @@ void vh_free_task_pixel_mod(void *data, struct task_struct *tsk)
 }
 
 void rvh_select_task_rq_fair_pixel_mod(void *data, struct task_struct *p, int prev_cpu, int sd_flag,
-				       int wake_flags, int *target_cpu)
+                    int wake_flags, int *target_cpu)
 {
-	int sync = (wake_flags & WF_SYNC) && !(current->flags & PF_EXITING);
-	bool sync_wakeup = false, prefer_prev = false;
-	int cpu;
-	int retry_count = vendor_sched_task_placement_retry_count;
+    int sync = (wake_flags & WF_SYNC) && !(current->flags & PF_EXITING);
+    bool sync_wakeup = false, prefer_prev = false;
+    int cpu;
+    int retry_count = vendor_sched_task_placement_retry_count;
 
-	/* sync wake up */
-	cpu = smp_processor_id();
+    /* sync wake up */
+    cpu = smp_processor_id();
 
-	_update_prefer_high_cap(p, sync && cpu >= pixel_cluster_start_cpu[1]);
+    _update_prefer_high_cap(p, sync && cpu >= pixel_cluster_start_cpu[1]);
 
-	if (sync && cpu_rq(cpu)->nr_running == 1 && cpumask_test_cpu(cpu, p->cpus_ptr) &&
-	     task_fits_capacity(p, cpu)) {
-		*target_cpu = cpu;
-		sync_wakeup = true;
-		goto out;
-	}
+    if (sync && cpu_rq(cpu)->nr_running == 1 && cpumask_test_cpu(cpu, p->cpus_ptr) &&
+         task_fits_capacity(p, cpu)) {
+        *target_cpu = cpu;
+        sync_wakeup = true;
+        goto out;
+    }
 
-	/* prefer prev cpu */
-	if (!cpumask_test_cpu(prev_cpu, &skip_prefer_prev_mask) && cpu_active(prev_cpu) &&
-	    cpu_is_idle(prev_cpu) && task_fits_capacity(p, prev_cpu) &&
-	    cpumask_test_cpu(prev_cpu, p->cpus_ptr) && check_preferred_idle_mask(p, prev_cpu) &&
-	    !cpumask_test_cpu(prev_cpu, get_group_cfs_skip_mask(p))) {
+    /* prefer prev cpu */
+    if (!cpumask_test_cpu(prev_cpu, &skip_prefer_prev_mask) && cpu_active(prev_cpu) &&
+        cpu_is_idle(prev_cpu) && task_fits_capacity(p, prev_cpu) &&
+        cpumask_test_cpu(prev_cpu, p->cpus_ptr) && check_preferred_idle_mask(p, prev_cpu) &&
+        !cpumask_test_cpu(prev_cpu, get_group_cfs_skip_mask(p))) {
 
-		struct cpuidle_state *idle_state;
-		unsigned int exit_lat = UINT_MAX;
+        struct cpuidle_state *idle_state;
+        unsigned int exit_lat = UINT_MAX;
 
-		rcu_read_lock();
-		idle_state = idle_get_state(cpu_rq(prev_cpu));
+        rcu_read_lock();
+        idle_state = idle_get_state(cpu_rq(prev_cpu));
 
-		if (sched_cpu_idle(prev_cpu))
-			exit_lat = 1;
-		else if (idle_state)
-			exit_lat = idle_state->exit_latency;
+        if (sched_cpu_idle(prev_cpu))
+            exit_lat = 0;
+        else if (idle_state)
+            exit_lat = idle_state->exit_latency;
 
-		rcu_read_unlock();
+        rcu_read_unlock();
 
-		if (exit_lat <= C1_EXIT_LATENCY) {
-			prefer_prev = true;
-			*target_cpu = prev_cpu;
-			goto out;
-		}
-	}
+        if (exit_lat <= C1_EXIT_LATENCY) {
+            prefer_prev = true;
+            *target_cpu = prev_cpu;
+            goto out;
+        }
+    }
 
-retry:
-	if ((sd_flag & SD_BALANCE_WAKE) ||
-	    (static_branch_likely(&eas_fork_exec_enable) &&
-	     (sd_flag & (SD_BALANCE_FORK | SD_BALANCE_EXEC)))) {
-		get_vendor_task_struct(p)->in_feec = true;
-		*target_cpu = find_energy_efficient_cpu(p, prev_cpu, NULL);
-		get_vendor_task_struct(p)->in_feec = false;
-	}
+    if ((sd_flag & SD_BALANCE_WAKE) ||
+        (static_branch_likely(&eas_fork_exec_enable) &&
+         (sd_flag & (SD_BALANCE_FORK | SD_BALANCE_EXEC)))) {
+        get_vendor_task_struct(p)->in_feec = true;
+        *target_cpu = find_energy_efficient_cpu(p, prev_cpu, NULL);
+        get_vendor_task_struct(p)->in_feec = false;
+    }
 
-	if (*target_cpu != -1 && retry_count) {
-		struct cpuidle_state *idle_state;
-		unsigned int exit_lat = 0;
+    if (*target_cpu != -1 && retry_count) {
+        struct cpuidle_state *idle_state;
+        unsigned int exit_lat = 0;
 
-		rcu_read_lock();
-		idle_state = idle_get_state(cpu_rq(*target_cpu));
-		if (idle_state)
-			exit_lat = idle_state->exit_latency;
-		rcu_read_unlock();
+        rcu_read_lock();
+        idle_state = idle_get_state(cpu_rq(*target_cpu));
+        if (idle_state)
+            exit_lat = idle_state->exit_latency;
+        rcu_read_unlock();
 
-		if (is_latency_overloaded(p, cpu_rq(*target_cpu)) || (get_prefer_idle(p) &&
-		    *target_cpu >= pixel_cluster_start_cpu[pixel_cluster_num - 1] &&
-		    exit_lat > C1_EXIT_LATENCY)) {
-			retry_count -= 1;
-			udelay(vendor_sched_task_placement_retry_delay_us);
-			goto retry;
-		}
-	}
+        if (is_latency_overloaded(p, cpu_rq(*target_cpu)) || (get_prefer_idle(p) &&
+            *target_cpu >= pixel_cluster_start_cpu[pixel_cluster_num - 1] &&
+            exit_lat > C1_EXIT_LATENCY)) {
+            
+            /* 
+             * OPTIMIZATION: Eliminate Active Busy-Wait Spin Delay
+             * Instead of actively spinning the core with udelay() which prevents 
+             * power collapse and generates thermal heat, gracefully fall back 
+             * to prev_cpu or bypass the active loop.
+             */
+            *target_cpu = prev_cpu;
+        }
+    }
 
 out:
-	if (trace_sched_select_task_rq_fair_enabled())
-		trace_sched_select_task_rq_fair(p, task_util_est(p),
-						sync_wakeup, get_adpf(p, true), prefer_prev,
-						get_prefer_high_cap(p),
-						get_vendor_group(p),
-						uclamp_eff_value_pixel_mod(p, UCLAMP_MIN),
+    if (trace_sched_select_task_rq_fair_enabled())
+        trace_sched_select_task_rq_fair(p, task_util_est(p),
+                        sync_wakeup, get_adpf(p, true), prefer_prev,
+                        get_prefer_high_cap(p),
+                        get_vendor_group(p),
+                        uclamp_eff_value_pixel_mod(p, UCLAMP_MIN),
+                        uclamp_eff_value_pixel_mod(p, UCLAMP_MAX),
+                        prev_cpu, *target_cpu);
+
 						uclamp_eff_value_pixel_mod(p, UCLAMP_MAX),
 						prev_cpu, *target_cpu);
 
 	_reset_prefer_high_cap(p);
 }
-
+}
 void rvh_set_user_nice_locked_pixel_mod(void *data, struct task_struct *p, long *nice,
 					bool *allowed)
 {
