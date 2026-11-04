@@ -75,6 +75,9 @@ struct sugov_policy {
 	unsigned int		cached_raw_freq;
 	unsigned int		prev_cached_raw_freq;
 
+    /* Track dominant CPU for shared policy evaluation affinity */
+	unsigned int		last_max_cpu;
+
 	/* The next fields are only needed if fast switch cannot be used: */
 	struct			irq_work irq_work;
 	struct			kthread_work work;
@@ -1214,23 +1217,28 @@ static unsigned int sugov_next_freq_shared(struct sugov_cpu *sg_cpu, u64 time)
 	struct sugov_policy *sg_policy = sg_cpu->sg_policy;
 	struct cpufreq_policy *policy = sg_policy->policy;
 	unsigned long util = 0, max = 1;
-	unsigned int j;
+	unsigned int j, dominant_cpu;
 
-	/* 
-	 * OPTIMIZATION: Cluster-Wide Evaluation Caching
-	 * If the policy was evaluated less than 200 microseconds ago and 
-	 * no forced update is pending, reuse the stable cached next_freq 
-	 * to eliminate redundant multi-core polling overhead.
-	 */
-	if (likely(system_state >= SYSTEM_RUNNING) && 
-	    !sg_policy->need_freq_update &&
-	    (time - sg_policy->last_freq_update_time < 200 * NSEC_PER_USEC)) {
-		return sg_policy->next_freq;
+	/* Ensure system state is valid before using affinity caching */
+	dominant_cpu = (likely(system_state >= SYSTEM_RUNNING)) ? sg_policy->last_max_cpu : cpumask_first(policy->cpus);
+
+	/* Evaluate the historically dominant CPU first */
+	if (cpumask_test_cpu(dominant_cpu, policy->cpus)) {
+		struct sugov_cpu *dom_sg_cpu = &per_cpu(sugov_cpu, dominant_cpu);
+		sugov_get_util(dom_sg_cpu);
+		sugov_iowait_apply(dom_sg_cpu, time);
+		util = dom_sg_cpu->util;
+		max = dom_sg_cpu->max;
+		sg_policy->last_max_cpu = dominant_cpu;
 	}
 
+	/* Scan remaining CPUs in the cluster mask */
 	for_each_cpu(j, policy->cpus) {
 		struct sugov_cpu *j_sg_cpu = &per_cpu(sugov_cpu, j);
 		unsigned long j_util, j_max;
+
+		if (j == dominant_cpu)
+			continue;
 
 		sugov_get_util(j_sg_cpu);
 		sugov_iowait_apply(j_sg_cpu, time);
@@ -1240,6 +1248,7 @@ static unsigned int sugov_next_freq_shared(struct sugov_cpu *sg_cpu, u64 time)
 		if (j_util * max > j_max * util) {
 			util = j_util;
 			max = j_max;
+			sg_policy->last_max_cpu = j;
 		}
 	}
 
@@ -2274,6 +2283,10 @@ static int sugov_start(struct cpufreq_policy *policy)
 	sg_policy->need_freq_update		= false;
 	sg_policy->cached_raw_freq		= 0;
 	sg_policy->prev_cached_raw_freq		= 0;
+
+    /* Initialize dominant CPU affinity tracker */
+	sg_policy->last_max_cpu = cpumask_first(policy->cpus);
+
 #if IS_ENABLED(CONFIG_PIXEL_EM_FREQUENCY_SCALING)
 	sg_policy->scaling_freq_min		= 0;
 	sg_policy->scaling_freq_max		= UINT_MAX;
