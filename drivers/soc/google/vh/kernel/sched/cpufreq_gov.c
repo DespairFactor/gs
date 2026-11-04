@@ -181,38 +181,46 @@ void reset_scaling_freq(int cpu)
 
 static __always_inline
 unsigned long uclamp_rq_util_with(struct rq *rq, unsigned long util,
-				  struct task_struct *p)
+                  struct task_struct *p)
 {
-	unsigned long min_util = 0;
-	unsigned long max_util = 0;
+    unsigned long min_util = 0;
+    unsigned long max_util = 0;
 
-	if (!static_branch_likely(&sched_uclamp_used))
-		return util;
+    if (!static_branch_likely(&sched_uclamp_used))
+        return util;
 
-	if (p) {
-		min_util = uclamp_eff_value(p, UCLAMP_MIN);
-		max_util = uclamp_eff_value(p, UCLAMP_MAX);
+    if (p) {
+        min_util = uclamp_eff_value(p, UCLAMP_MIN);
+        max_util = uclamp_eff_value(p, UCLAMP_MAX);
 
-		/*
-		 * Ignore last runnable task's max clamp, as this task will
-		 * reset it. Similarly, no need to read the rq's min clamp.
-		 */
-		if (uclamp_rq_is_idle(rq))
-			goto out;
-	}
+        /*
+         * Ignore last runnable task's max clamp, as this task will
+         * reset it. Similarly, no need to read the rq's min clamp.
+         */
+        if (uclamp_rq_is_idle(rq))
+            goto out;
+    }
 
-	min_util = max_t(unsigned long, min_util, uclamp_rq_get(rq, UCLAMP_MIN));
-	max_util = max_t(unsigned long, max_util, uclamp_rq_get(rq, UCLAMP_MAX));
+    min_util = max_t(unsigned long, min_util, uclamp_rq_get(rq, UCLAMP_MIN));
+    max_util = max_t(unsigned long, max_util, uclamp_rq_get(rq, UCLAMP_MAX));
 out:
-	/*
-	 * Since CPU's {min,max}_util clamps are MAX aggregated considering
-	 * RUNNABLE tasks with _different_ clamps, we can end up with an
-	 * inversion. Fix it now when the clamps are applied.
-	 */
-	if (unlikely(min_util >= max_util))
-		return min_util;
+    /*
+     * Since CPU's {min,max}_util clamps are MAX aggregated considering
+     * RUNNABLE tasks with _different_ clamps, we can end up with an
+     * inversion. Fix it now when the clamps are applied.
+     */
+    if (unlikely(min_util >= max_util))
+        return min_util;
 
-	return clamp(util, min_util, max_util);
+    /* 
+     * OPTIMIZATION: Identity Clamp Bypass
+     * If uclamp limits are unconstrained (min is 0, max is at or above 
+     * full capacity scale), clamping is an identity operation. Skip it.
+     */
+    if (likely(min_util == 0 && max_util >= SCHED_CAPACITY_SCALE))
+        return util;
+
+    return clamp(util, min_util, max_util);
 }
 
 static inline bool sugov_em_profile_changed(struct sugov_policy *sg_policy)
