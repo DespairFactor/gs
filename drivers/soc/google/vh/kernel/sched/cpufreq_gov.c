@@ -1340,136 +1340,134 @@ static void update_avg_real_cap_cluster(struct cpufreq_policy *policy)
 static void
 sugov_update_shared(struct update_util_data *hook, u64 time, unsigned int flags)
 {
-	struct sugov_cpu *sg_cpu = container_of(hook, struct sugov_cpu, update_util);
-	struct sugov_policy *sg_policy = sg_cpu->sg_policy;
-	unsigned int next_f, suspend_resume_boost;
+    struct sugov_cpu *sg_cpu = container_of(hook, struct sugov_cpu, update_util);
+    struct sugov_policy *sg_policy = sg_cpu->sg_policy;
+    unsigned int next_f, suspend_resume_boost;
 
-	/* 
-	 * OPTIMIZATION: Lock-Free Rate-Limit Fast-Path Pre-Check
-	 */
-	if (likely(system_state >= SYSTEM_RUNNING) && 
-	    !(flags & SCHED_PIXEL_FORCE_UPDATE) &&
-	    !READ_ONCE(sg_policy->work_in_progress) &&
-	    !READ_ONCE(sg_policy->limits_changed)) {
-		s64 delta_ns = time - READ_ONCE(sg_policy->last_freq_update_time);
-		s64 min_rate = READ_ONCE(sg_policy->min_rate_limit_ns);
+    /* 
+     * OPTIMIZATION: Lock-Free Utilization Stability & Rate-Limit Pre-Check
+     * If the rate limit window has not elapsed AND core utilization 
+     * has not changed since the last evaluation, bypass the policy 
+     * spinlock acquisition entirely to eliminate core contention.
+     */
+    if (likely(system_state >= SYSTEM_RUNNING) && 
+        !(flags & SCHED_PIXEL_FORCE_UPDATE) &&
+        !READ_ONCE(sg_policy->work_in_progress) &&
+        !READ_ONCE(sg_policy->limits_changed)) {
+        s64 delta_ns = time - READ_ONCE(sg_policy->last_freq_update_time);
+        s64 min_rate = READ_ONCE(sg_policy->min_rate_limit_ns);
 
-		if (delta_ns < min_rate) {
-			sugov_iowait_boost(sg_cpu, time, flags);
-			sg_cpu->last_update = time;
-			pmu_poll_defer_work(time);
-			return;
-		}
-	}
+        if (delta_ns < min_rate) {
+            sugov_iowait_boost(sg_cpu, time, flags);
+            sg_cpu->last_update = time;
+            pmu_poll_defer_work(time);
 
-	raw_spin_lock(&sg_policy->update_lock);
+            if (cpu_util_cfs(sg_cpu->cpu) == sg_cpu->last_evaluated_util)
+                return;
+        }
+    }
 
-	sg_policy->limits_changed |= flags & SCHED_PIXEL_FORCE_UPDATE;
+    raw_spin_lock(&sg_policy->update_lock);
+
+    sg_policy->limits_changed |= flags & SCHED_PIXEL_FORCE_UPDATE;
 
 #if IS_ENABLED(CONFIG_UCLAMP_STATS)
-	update_uclamp_stats(sg_cpu->cpu, time);
+    update_uclamp_stats(sg_cpu->cpu, time);
 #endif
 
-	sugov_iowait_boost(sg_cpu, time, flags);
-	sg_cpu->last_update = time;
+    sugov_iowait_boost(sg_cpu, time, flags);
+    sg_cpu->last_update = time;
 
-	pmu_poll_defer_work(time);
+    pmu_poll_defer_work(time);
 
-	ignore_dl_rate_limit(sg_cpu);
+    ignore_dl_rate_limit(sg_cpu);
 
-	if (sugov_should_update_freq(sg_cpu->sg_policy, time)) {
-		bool busy;
+    if (sugov_should_update_freq(sg_cpu->sg_policy, time)) {
+        bool busy;
 
-		next_f = sugov_next_freq_shared(sg_cpu, time);
-		sg_cpu->last_evaluated_util = sg_cpu->util;
+        next_f = sugov_next_freq_shared(sg_cpu, time);
+        sg_cpu->last_evaluated_util = sg_cpu->util;
 
-		/* 
-		 * OPTIMIZATION: Per-CPU Local Frequency Caching
-		 * If the newly computed target frequency matches this core's local 
-		 * cache, bypass policy updates and driver calls to eliminate 
-		 * inter-core cacheline bouncing.
-		 */
-		if (likely(next_f == sg_cpu->cached_target_freq))
-			goto unlock;
-		sg_cpu->cached_target_freq = next_f;
+        /* 
+         * OPTIMIZATION: Per-CPU Local Frequency Caching
+         */
+        if (likely(next_f == sg_cpu->cached_target_freq))
+            goto unlock;
+        sg_cpu->cached_target_freq = next_f;
 
-		busy = !sg_cpu->sg_policy->need_freq_update && sugov_cpu_is_busy(sg_cpu, time);
+        busy = !sg_cpu->sg_policy->need_freq_update && sugov_cpu_is_busy(sg_cpu, time);
 
-		if (static_branch_likely(&auto_dvfs_headroom_enable) &&
-		    !uclamp_rq_is_capped(cpu_rq(sg_cpu->cpu)) &&
-		    busy && next_f < sg_cpu->sg_policy->next_freq) {
-			next_f = sg_cpu->sg_policy->next_freq;
-			sg_cpu->sg_policy->cached_raw_freq = sg_cpu->sg_policy->prev_cached_raw_freq;
-		}
+        if (static_branch_likely(&auto_dvfs_headroom_enable) &&
+            !uclamp_rq_is_capped(cpu_rq(sg_cpu->cpu)) &&
+            busy && next_f < sg_cpu->sg_policy->next_freq) {
+            next_f = sg_cpu->sg_policy->next_freq;
+            sg_cpu->sg_policy->cached_raw_freq = sg_cpu->sg_policy->prev_cached_raw_freq;
+        }
 
-		if (!sugov_update_next_freq(sg_cpu->sg_policy, time, next_f))
-			goto unlock;
-			
-		/* 
-		 * OPTIMIZATION: Cluster Capacity Average Update Pruning
-		 * Skip recalculating cluster real capacity averages if core 
-		 * utilization has not changed since the last evaluation and 
-		 * the policy frequency is already at the target.
-		 */
-		if (sg_cpu->util != sg_cpu->last_evaluated_util || 
-		    sg_policy->policy->cur != next_f) {
-			update_avg_real_cap_cluster(sg_policy->policy);
-		}
+        if (!sugov_update_next_freq(sg_cpu->sg_policy, time, next_f))
+            goto unlock;
+            
+        /* 
+         * OPTIMIZATION: Cluster Capacity Average Update Pruning
+         */
+        if (sg_cpu->util != sg_cpu->last_evaluated_util || 
+            sg_policy->policy->cur != next_f) {
+            update_avg_real_cap_cluster(sg_policy->policy);
+        }
 
-		if (trace_sugov_util_update_enabled())
-			trace_sugov_util_update(sg_cpu->cpu, sg_cpu->util, sg_cpu->max, flags);
+        if (trace_sugov_util_update_enabled())
+            trace_sugov_util_update(sg_cpu->cpu, sg_cpu->util, sg_cpu->max, flags);
 
 #if IS_ENABLED(CONFIG_PIXEL_EM_FREQUENCY_SCALING)
-		next_f = clamp(next_f, sg_cpu->sg_policy->scaling_freq_min,
-				    sg_cpu->sg_policy->scaling_freq_max);
+        next_f = clamp(next_f, sg_cpu->sg_policy->scaling_freq_min,
+                    sg_cpu->sg_policy->scaling_freq_max);
 #endif
 
-		if (in_suspend_resume) {
-			suspend_resume_boost = map_util_freq_pixel_mod(vendor_sched_suspend_resume_boost,
-							    sg_cpu->sg_policy->policy->cpuinfo.max_freq,
-							    sg_cpu->max, sg_cpu->cpu);
-			next_f = max(next_f, suspend_resume_boost);
-		}
+        if (in_suspend_resume) {
+            suspend_resume_boost = map_util_freq_pixel_mod(vendor_sched_suspend_resume_boost,
+                                    sg_cpu->sg_policy->policy->cpuinfo.max_freq,
+                                    sg_cpu->max, sg_cpu->cpu);
+            next_f = max(next_f, suspend_resume_boost);
+        }
 
-		if (sg_cpu->sg_policy->policy->fast_switch_enabled)
-			cpufreq_driver_fast_switch(sg_cpu->sg_policy->policy, next_f);
-		else
-			sugov_deferred_update(sg_cpu->sg_policy);
+        if (sg_cpu->sg_policy->policy->fast_switch_enabled)
+            cpufreq_driver_fast_switch(sg_cpu->sg_policy->policy, next_f);
+        else
+            sugov_deferred_update(sg_cpu->sg_policy);
 
-		/* 
-		 * OPTIMIZATION: Auxiliary Governor Notification Pruning
-		 * Skip dsulat and memlat frequency updates if the target frequency 
-		 * matches the currently active policy frequency (policy->cur).
-		 */
-		if (next_f != sg_cpu->sg_policy->policy->cur) {
-			if (static_branch_likely(&dsulat_fast_switch_enable))
-				gs_governor_dsulat_cpufreq_update(sg_cpu->sg_policy->policy, next_f);
+        /* 
+         * OPTIMIZATION: Auxiliary Governor Notification Pruning
+         */
+        if (next_f != sg_cpu->sg_policy->policy->cur) {
+            if (static_branch_likely(&dsulat_fast_switch_enable))
+                gs_governor_dsulat_cpufreq_update(sg_cpu->sg_policy->policy, next_f);
 
-			if (static_branch_likely(&memlat_fast_switch_enable))
-				gs_governor_memlat_cpufreq_update(sg_cpu->sg_policy->policy, next_f);
-		}
+            if (static_branch_likely(&memlat_fast_switch_enable))
+                gs_governor_memlat_cpufreq_update(sg_cpu->sg_policy->policy, next_f);
+        }
 
-		if (sugov_em_profile_changed(sg_cpu->sg_policy))
-			sugov_update_response_time_mult(sg_cpu->sg_policy, true);
+        if (sugov_em_profile_changed(sg_cpu->sg_policy))
+            sugov_update_response_time_mult(sg_cpu->sg_policy, true);
 
-		if (!sg_cpu->sg_policy->rtm_fix_enabled &&
-		    static_branch_likely(&response_time_ms_fix_enable)) {
-			sg_cpu->sg_policy->rtm_fix_enabled = true;
-			sugov_update_response_time_mult(sg_cpu->sg_policy, false);
-		}
-		if (sg_cpu->sg_policy->rtm_fix_enabled &&
-		    !static_branch_likely(&response_time_ms_fix_enable)) {
-			sg_cpu->sg_policy->rtm_fix_enabled = false;
-			sugov_update_response_time_mult(sg_cpu->sg_policy, false);
-		}
+        if (!sg_cpu->sg_policy->rtm_fix_enabled &&
+            static_branch_likely(&response_time_ms_fix_enable)) {
+            sg_cpu->sg_policy->rtm_fix_enabled = true;
+            sugov_update_response_time_mult(sg_cpu->sg_policy, false);
+        }
+        if (sg_cpu->sg_policy->rtm_fix_enabled &&
+            !static_branch_likely(&response_time_ms_fix_enable)) {
+            sg_cpu->sg_policy->rtm_fix_enabled = false;
+            sugov_update_response_time_mult(sg_cpu->sg_policy, false);
+        }
 
 #if IS_ENABLED(CONFIG_PIXEL_EM_FREQUENCY_SCALING)
-		scaling_freq_update(sg_cpu->sg_policy);
+        scaling_freq_update(sg_cpu->sg_policy);
 #endif
-	}
+    }
 unlock:
-	raw_spin_unlock(&sg_cpu->sg_policy->update_lock);
+    raw_spin_unlock(&sg_cpu->sg_policy->update_lock);
 }
+
 static void sugov_work(struct kthread_work *work)
 {
 	struct sugov_policy *sg_policy = container_of(work, struct sugov_policy, work);
