@@ -1403,11 +1403,18 @@ sugov_update_shared(struct update_util_data *hook, u64 time, unsigned int flags)
 		else
 			sugov_deferred_update(sg_cpu->sg_policy);
 
-		if (static_branch_likely(&dsulat_fast_switch_enable))
-			gs_governor_dsulat_cpufreq_update(sg_cpu->sg_policy->policy, next_f);
+		/* 
+		 * OPTIMIZATION: Auxiliary Governor Notification Pruning
+		 * Skip dsulat and memlat frequency updates if the target frequency 
+		 * matches the currently active policy frequency (policy->cur).
+		 */
+		if (next_f != sg_cpu->sg_policy->policy->cur) {
+			if (static_branch_likely(&dsulat_fast_switch_enable))
+				gs_governor_dsulat_cpufreq_update(sg_cpu->sg_policy->policy, next_f);
 
-		if (static_branch_likely(&memlat_fast_switch_enable))
-			gs_governor_memlat_cpufreq_update(sg_cpu->sg_policy->policy, next_f);
+			if (static_branch_likely(&memlat_fast_switch_enable))
+				gs_governor_memlat_cpufreq_update(sg_cpu->sg_policy->policy, next_f);
+		}
 
 		if (sugov_em_profile_changed(sg_cpu->sg_policy))
 			sugov_update_response_time_mult(sg_cpu->sg_policy, true);
