@@ -1176,28 +1176,41 @@ struct vendor_util_group_property *get_vendor_util_group_property(enum utilizati
 
 static bool task_fits_capacity(struct task_struct *p, int cpu)
 {
-	unsigned long uclamp_min = uclamp_eff_value_pixel_mod(p, UCLAMP_MIN);
-	unsigned long uclamp_max = uclamp_eff_value_pixel_mod(p, UCLAMP_MAX);
-	unsigned long task_util = task_util_est(p);
-	bool fits;
+    unsigned long uclamp_min = uclamp_eff_value_pixel_mod(p, UCLAMP_MIN);
+    unsigned long uclamp_max = uclamp_eff_value_pixel_mod(p, UCLAMP_MAX);
+    unsigned long task_util = task_util_est(p);
+    unsigned long cpu_cap = arch_scale_cpu_capacity(cpu);
+    bool fits;
 
-	if (cpu >= pixel_cluster_start_cpu[pixel_cluster_num - 1])
-		return true;
+    if (cpu >= pixel_cluster_start_cpu[pixel_cluster_num - 1])
+        return true;
+
+    /* 
+     * OPTIMIZATION: Capacity Fast-Path Pruning
+     * If the CPU's raw capacity easily accommodates the task's max uclamp 
+     * and estimated utilization with substantial headroom (> 25% spare), 
+     * bypass expensive group throttle and memory pressure constraint math.
+     */
+    if (likely(uclamp_max >= SCHED_CAPACITY_SCALE && 
+               (task_util + (task_util >> 2)) < cpu_cap && 
+               !get_vendor_task_struct(p)->iowait_boost)) {
+        return true;
+    }
 
 #if IS_ENABLED(CONFIG_USE_GROUP_THROTTLE)
-	/* clamp task utilization against its per-cpu group limit */
-	task_util = min_t(unsigned long, task_util, cap_scale(get_task_group_throttle(p),
-							arch_scale_cpu_capacity(cpu)));
+    /* clamp task utilization against its per-cpu group limit */
+    task_util = min_t(unsigned long, task_util, cap_scale(get_task_group_throttle(p),
+                          cpu_cap));
 #endif
 
-	uclamp_min = max(uclamp_min, get_vendor_task_struct(p)->iowait_boost);
+    uclamp_min = max(uclamp_min, get_vendor_task_struct(p)->iowait_boost);
 
-	fits = util_fits_cpu(task_util, uclamp_min, uclamp_max, cpu);
+    fits = util_fits_cpu(task_util, uclamp_min, uclamp_max, cpu);
 
-	if (static_key_enabled(&per_task_memory_aware_enable))
-		fits = fits && memory_pressure_fits_cpu(p, cpu);
+    if (static_key_enabled(&per_task_memory_aware_enable))
+        fits = fits && memory_pressure_fits_cpu(p, cpu);
 
-	return fits;
+    return fits;
 }
 
 void rvh_util_fits_cpu_pixel_mod(void *data, unsigned long util, unsigned long uclamp_min,
