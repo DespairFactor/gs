@@ -1381,7 +1381,17 @@ sugov_update_shared(struct update_util_data *hook, u64 time, unsigned int flags)
 
 		if (!sugov_update_next_freq(sg_cpu->sg_policy, time, next_f))
 			goto unlock;
-		update_avg_real_cap_cluster(sg_cpu->sg_policy->policy);
+			
+		/* 
+		 * OPTIMIZATION: Cluster Capacity Average Update Pruning
+		 * Skip recalculating cluster real capacity averages if core 
+		 * utilization has not changed since the last evaluation and 
+		 * the policy frequency is already at the target.
+		 */
+		if (sg_cpu->util != sg_cpu->last_evaluated_util || 
+		    sg_policy->policy->cur != next_f) {
+			update_avg_real_cap_cluster(sg_policy->policy);
+		}
 
 		if (trace_sugov_util_update_enabled())
 			trace_sugov_util_update(sg_cpu->cpu, sg_cpu->util, sg_cpu->max, flags);
