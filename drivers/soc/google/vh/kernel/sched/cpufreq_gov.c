@@ -396,7 +396,17 @@ sugov_apply_response_time(unsigned long util, int cpu)
 	if (!static_branch_likely(&auto_dvfs_headroom_enable))
 		return util;
 
-	mult = per_cpu(response_time_mult, cpu) * util;
+	mult = per_cpu(response_time_mult, cpu);
+
+	/* 
+	 * OPTIMIZATION: Response Time Identity Bypass
+	 * If the multiplier is at standard capacity scale (1024), 
+	 * multiplication is an identity operation. Skip it to save arithmetic cycles.
+	 */
+	if (likely(mult == SCHED_CAPACITY_SCALE))
+		return util;
+
+	mult = mult * util;
 
 	return mult >> SCHED_CAPACITY_SHIFT;
 }
