@@ -210,23 +210,28 @@ unsigned long approximate_util_avg(unsigned long util, u64 delta)
  */
 u64 approximate_runtime(unsigned long util)
 {
-	struct sched_avg sa = {};
-	u64 delta = static_branch_likely(&enable_ptick) ? PTICK_PERIOD_US : TICK_USEC;
-	u64 runtime = 0;
+    struct sched_avg sa = {};
+    u64 step_us = static_branch_likely(&enable_ptick) ? PTICK_PERIOD_US : TICK_USEC;
+    u64 total_us = 0;
 
-	if (unlikely(!util))
-		return runtime;
+    if (unlikely(!util))
+        return 0;
 
-	while (sa.util_avg < util) {
-		accumulate_sum(delta, &sa, 1, 0, 1);
-		___update_load_avg(&sa, 0);
-		runtime++;
-	}
+    /* 
+     * OPTIMIZATION: Coarse-to-Fine Step Acceleration
+     * When far from target utilization, step by larger 16ms intervals 
+     * to bypass hundreds of redundant loop iterations. Refine by standard 
+     * step intervals when approaching the target.
+     */
+    while (sa.util_avg < util) {
+        u64 delta = (util - sa.util_avg > 100) ? (16 * 1024) : step_us;
 
-	if (static_branch_likely(&enable_ptick))
-		return runtime * (unsigned int)(PTICK_PERIOD_US/USEC_PER_MSEC);
-	else
-		return runtime * (TICK_USEC/USEC_PER_MSEC);
+        accumulate_sum(delta, &sa, 1, 0, 1);
+        ___update_load_avg(&sa, 0);
+        total_us += delta;
+    }
+
+    return total_us / USEC_PER_MSEC;
 }
 
 static inline u64
