@@ -619,24 +619,24 @@ static bool sugov_up_down_rate_limit(struct sugov_policy *sg_policy, u64 time,
 
 	delta_ns = time - sg_policy->last_freq_update_time;
 
-	if (next_freq > sg_policy->next_freq &&
-	    delta_ns < sg_policy->up_rate_delay_ns)
-			return true;
-
-	/*
-	 * TODO: consider using a table with ratio and rate limit defined
-	 * Here consider the ratio of freq change e.g. selecting larger rate limit
-	 * when freq changed dramatically and smaller rate limit for the opposite.
-	 * here for simple, rate_limit = down_rate_delay_ns * new_freq / old_freq
-	 * Also we are not going to update update_min_rate_limit_ns, so the minimal
-	 * rate limit is still the min(down_rate_delay_ns, up_rate_delay_ns).
+	/* 
+	 * OPTIMIZATION: Proportional Up-Rate Scaling
+	 * If ramping up significantly, scale the required up-rate delay down 
+	 * proportionally based on the magnitude of the frequency increase, 
+	 * allowing massive surges to hit instantly without violating minor rate limits.
 	 */
-	comp = sg_policy->down_rate_delay_ns * next_freq;
-	for (i = 0; i < sg_policy->down_rate_limit_scale_pow - 1; i++) {
-		comp = comp / sg_policy->next_freq * next_freq;
+	if (next_freq > sg_policy->next_freq) {
+		unsigned long up_comp = sg_policy->up_rate_delay_ns * sg_policy->next_freq / next_freq;
+		if (delta_ns < up_comp)
+			return true;
+	} else {
+		comp = sg_policy->down_rate_delay_ns * next_freq;
+		for (i = 0; i < sg_policy->down_rate_limit_scale_pow - 1; i++) {
+			comp = comp / sg_policy->next_freq * next_freq;
+		}
+		if (delta_ns * sg_policy->next_freq < comp)
+			return true;
 	}
-	if (next_freq < sg_policy->next_freq && delta_ns * sg_policy->next_freq < comp)
-		return true;
 
 	return false;
 }
