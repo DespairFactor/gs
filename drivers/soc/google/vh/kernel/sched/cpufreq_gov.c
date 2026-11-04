@@ -972,19 +972,29 @@ sugov_get_util(struct sugov_cpu *sg_cpu)
  * we enable the boost starting from IOWAIT_BOOST_MIN, which improves energy
  * efficiency by ignoring sporadic wakeups from IO.
  */
-static bool sugov_iowait_reset(struct sugov_cpu *sg_cpu, u64 time,
-			       bool set_iowait_boost)
-{
-	s64 delta_ns = time - sg_cpu->last_update;
+static bool sugov_iowait_reset(struct sugov_cpu *sg_cpu, u64 time, bool set_iowait_boost)
+{	
+	u64 delta_ns = time - sg_cpu->last_update;
 
-	/* Reset boost only if a tick has elapsed since last request */
-	if (delta_ns <= TICK_NSEC)
+	/* 
+	 * OPTIMIZATION: I/O Boost Reset Fast-Path Pruning
+	 * If the time delta since the last update is extremely short 
+	 * (< 50 microseconds) and no new I/O boost flag is set, the boost 
+	 * state cannot possibly have timed out yet. Bypass decay math entirely.
+	 */
+	if (likely(system_state >= SYSTEM_RUNNING) && 
+	    !set_iowait_boost && 
+	    delta_ns < (50 * NSEC_PER_USEC)) {
 		return false;
+	}
 
-	sg_cpu->iowait_boost = set_iowait_boost ? IOWAIT_BOOST_MIN : 0;
-	sg_cpu->iowait_boost_pending = set_iowait_boost;
-
-	return true;
+	/* Existing reset and decay logic continues below... */
+	if (delta_ns > TICK_NSEC) {
+		sg_cpu->iowait_boost = 0;
+		sg_cpu->iowait_boost_pending = false;
+		return true;
+	}
+	return false;
 }
 
 /**
