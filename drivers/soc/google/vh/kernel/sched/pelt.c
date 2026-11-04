@@ -331,8 +331,17 @@ ___update_mem_pressure(u64 now, struct sched_entity *se, int cpu, int on_rq, int
 	struct task_struct *p = task_of(se);
 	struct vendor_task_struct *vp = get_vendor_task_struct(p);
 	int ret = 0;
+    
+    /* 
+     * OPTIMIZATION: Lockless Time-Delta Pre-Check
+     * Bail out instantly if insufficient time has elapsed, avoiding 
+     * spinlock acquisition and 5 hardware PMU counter reads.
+     */
+    delta = now - READ_ONCE(vp->mp_stats.mp.last_update_time);
+    if ((s64)delta < 0 || (delta >> 10) == 0)
+        return 0;
 
-	raw_spin_lock(&vp->lock);
+    raw_spin_lock(&vp->lock);
 
 	if (cpu == raw_smp_processor_id() &&
 	    !read_perf_event_local(cpu, CORE_STALL_INDEX, &stall) &&
