@@ -121,6 +121,7 @@ struct sugov_cpu {
 
     /* Added field to track last evaluated utilization for delta filtering */
 	unsigned long           last_evaluated_util;
+    unsigned int cached_target_freq;
 
 	/* The field below is for single-CPU policies only: */
 #if IS_ENABLED(CONFIG_NO_HZ_COMMON)
@@ -950,9 +951,8 @@ unsigned long schedutil_cpu_util_pixel_mod(int cpu, unsigned long util_cfs,
 
 static void sugov_get_util(struct sugov_cpu *sg_cpu)
 {
-	unsigned long util = sched_cpu_util(sg_cpu->cpu, &sg_cpu->max);
-
-	sg_cpu->util = util;
+	sg_cpu->util = cpu_util_cfs(sg_cpu->cpu);
+	sg_cpu->max = arch_scale_cpu_capacity(sg_cpu->cpu);
 }
 
 /**
@@ -1323,9 +1323,6 @@ sugov_update_shared(struct update_util_data *hook, u64 time, unsigned int flags)
 
 	/* 
 	 * OPTIMIZATION: Lock-Free Rate-Limit Fast-Path Pre-Check
-	 * If the system is fully running, no forced updates are flagged, 
-	 * and we are strictly within the minimum rate-limit window, skip 
-	 * acquiring update_lock entirely to eliminate inter-core lock contention.
 	 */
 	if (likely(system_state >= SYSTEM_RUNNING) && 
 	    !(flags & SCHED_PIXEL_FORCE_UPDATE) &&
@@ -1335,7 +1332,6 @@ sugov_update_shared(struct update_util_data *hook, u64 time, unsigned int flags)
 		s64 min_rate = READ_ONCE(sg_policy->min_rate_limit_ns);
 
 		if (delta_ns < min_rate) {
-			/* Fast-path exit: apply iowait boost and bail out lock-free */
 			sugov_iowait_boost(sg_cpu, time, flags);
 			sg_cpu->last_update = time;
 			pmu_poll_defer_work(time);
@@ -1364,7 +1360,16 @@ sugov_update_shared(struct update_util_data *hook, u64 time, unsigned int flags)
 		next_f = sugov_next_freq_shared(sg_cpu, time);
 		sg_cpu->last_evaluated_util = sg_cpu->util;
 
-		/* Limits may have changed, don't skip frequency update */
+		/* 
+		 * OPTIMIZATION: Per-CPU Local Frequency Caching
+		 * If the newly computed target frequency matches this core's local 
+		 * cache, bypass policy updates and driver calls to eliminate 
+		 * inter-core cacheline bouncing.
+		 */
+		if (likely(next_f == sg_cpu->cached_target_freq))
+			goto unlock;
+		sg_cpu->cached_target_freq = next_f;
+
 		busy = !sg_cpu->sg_policy->need_freq_update && sugov_cpu_is_busy(sg_cpu, time);
 
 		if (static_branch_likely(&auto_dvfs_headroom_enable) &&
@@ -1425,7 +1430,6 @@ sugov_update_shared(struct update_util_data *hook, u64 time, unsigned int flags)
 unlock:
 	raw_spin_unlock(&sg_cpu->sg_policy->update_lock);
 }
-
 static void sugov_work(struct kthread_work *work)
 {
 	struct sugov_policy *sg_policy = container_of(work, struct sugov_policy, work);
