@@ -1650,6 +1650,14 @@ static void pmu_poll_defer_work(u64 time)
 {
 	u64 delta_ms;
 
+	/* 
+	 * OPTIMIZATION: Lockless PMU Poll Fast-Path Bypass
+	 * If PMU polling is disabled, skip acquiring the spinlock entirely 
+	 * to eliminate cacheline bouncing and lock contention across CPU update hooks.
+	 */
+	if (!READ_ONCE(pmu_poll_enabled))
+		return;
+
 	if (!spin_trylock(&pmu_poll_enable_lock))
 		return;
 
