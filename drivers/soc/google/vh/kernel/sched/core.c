@@ -310,19 +310,30 @@ static void prepare_task_pmu(int cpu, struct task_struct *p, u64 cycle, u64 stal
 
 static void update_task_pmu(int cpu, struct task_struct *prev, struct task_struct *next)
 {
-	u64 cycle, stall, inst, mem_rd_inst, mem_wr_inst;
+    u64 cycle, stall, inst, mem_rd_inst, mem_wr_inst;
+    bool prev_tracked = !is_idle_task(prev) && !(prev->flags & PF_EXITING);
+    bool next_tracked = !is_idle_task(next) && !(next->flags & PF_EXITING);
 
-	if (read_perf_event_local(cpu, CORE_INST_INDEX, &inst) ||
-	    read_perf_event_local(cpu, CORE_STALL_INDEX, &stall) ||
-	    read_perf_event_local(cpu, CORE_CYCLE_INDEX, &cycle) ||
-	    read_perf_event_local(cpu, CORE_MEM_RD_INST_INDEX, &mem_rd_inst) ||
-	    read_perf_event_local(cpu, CORE_MEM_WR_INST_INDEX, &mem_wr_inst))
-		return;
+    /* 
+     * OPTIMIZATION: Task-Validity PMU Pre-Check
+     * If neither the previous nor the next task requires memory pressure 
+     * tracking (e.g., idle-to-idle switches), bypass the 5 hardware 
+     * PMU register reads entirely.
+     */
+    if (!prev_tracked && !next_tracked)
+        return;
 
-	if (!is_idle_task(prev) && !(prev->flags & PF_EXITING))
-		finish_task_pmu(cpu, prev, cycle, stall, inst, mem_rd_inst, mem_wr_inst);
-	if (!is_idle_task(next) && !(next->flags & PF_EXITING))
-		prepare_task_pmu(cpu, next, cycle, stall, inst, mem_rd_inst, mem_wr_inst);
+    if (read_perf_event_local(cpu, CORE_INST_INDEX, &inst) ||
+        read_perf_event_local(cpu, CORE_STALL_INDEX, &stall) ||
+        read_perf_event_local(cpu, CORE_CYCLE_INDEX, &cycle) ||
+        read_perf_event_local(cpu, CORE_MEM_RD_INST_INDEX, &mem_rd_inst) ||
+        read_perf_event_local(cpu, CORE_MEM_WR_INST_INDEX, &mem_wr_inst))
+        return;
+
+    if (prev_tracked)
+        finish_task_pmu(cpu, prev, cycle, stall, inst, mem_rd_inst, mem_wr_inst);
+    if (next_tracked)
+        prepare_task_pmu(cpu, next, cycle, stall, inst, mem_rd_inst, mem_wr_inst);
 }
 
 static inline void ptick_clear(struct rq *rq)
