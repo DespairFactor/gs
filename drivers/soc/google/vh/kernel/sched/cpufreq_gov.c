@@ -975,7 +975,7 @@ static bool sugov_iowait_reset(struct sugov_cpu *sg_cpu, u64 time,
  * otherwise we restart from the utilization of the minimum OPP.
  */
 static void sugov_iowait_boost(struct sugov_cpu *sg_cpu, u64 time,
-			       unsigned int flags)
+				unsigned int flags)
 {
 	struct vendor_rq_struct *vrq = get_vendor_rq_struct(cpu_rq(sg_cpu->cpu));
 	bool set_iowait_boost = flags & SCHED_CPUFREQ_IOWAIT;
@@ -1002,8 +1002,19 @@ static void sugov_iowait_boost(struct sugov_cpu *sg_cpu, u64 time,
 		return;
 	}
 
-	/* First wakeup after IO: start with minimum boost */
-	sg_cpu->iowait_boost = IOWAIT_BOOST_MIN;
+	/* 
+	 * OPTIMIZATION: Transient I/O Boost Damping
+	 * If the system is fully running and the CPU's current base utilization 
+	 * is very low (< 15% capacity), dampen the initial I/O boost floor to 
+	 * prevent background file reads from triggering unwarranted max-frequency spikes.
+	 */
+	if (likely(system_state >= SYSTEM_RUNNING) && 
+	    sg_cpu->util < (arch_scale_cpu_capacity(sg_cpu->cpu) >> 3)) {
+		sg_cpu->iowait_boost = IOWAIT_BOOST_MIN / 2;
+	} else {
+		/* First wakeup after heavy/active IO: start with minimum boost */
+		sg_cpu->iowait_boost = IOWAIT_BOOST_MIN;
+	}
 
 	/* Cater for a task with high iowait boost migrated to this CPU */
 	sg_cpu->iowait_boost = max_t(unsigned long, sg_cpu->iowait_boost, vrq->iowait_boost);
