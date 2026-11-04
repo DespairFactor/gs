@@ -218,25 +218,32 @@ static inline bool sugov_em_profile_changed(struct sugov_policy *sg_policy)
 {
 #if IS_ENABLED(CONFIG_PIXEL_EM)
 	struct pixel_em_profile *profile;
-	bool ret = false;
+	bool current_use_em = static_branch_likely(&use_em_for_freq_mapping);
 
-	if (sg_policy->use_em_mapping != static_branch_likely(&use_em_for_freq_mapping)) {
-		sg_policy->use_em_mapping = static_branch_likely(&use_em_for_freq_mapping);
-		ret = true;
+	/* 
+	 * OPTIMIZATION: EM Profile Fast-Path Validation
+	 * If the static branch mapping state and global EM profile pointer 
+	 * are unchanged, return false immediately without pointer dereferences.
+	 */
+	profile = get_em_profile();
+	if (likely(sg_policy->use_em_mapping == current_use_em && 
+		   sg_policy->em_profile == profile))
+		return false;
+
+	if (sg_policy->use_em_mapping != current_use_em) {
+		sg_policy->use_em_mapping = current_use_em;
+		return true;
 	}
 
-	profile = get_em_profile();
 	if (!profile)
-		goto out;
+		return false;
 
 	if (sg_policy->em_profile != profile) {
 		sg_policy->em_profile = profile;
-		ret = true;
+		return true;
 	}
-
 #endif
-out:
-	return ret;
+	return false;
 }
 
 static inline unsigned int
