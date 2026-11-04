@@ -1198,6 +1198,18 @@ static unsigned int sugov_next_freq_shared(struct sugov_cpu *sg_cpu, u64 time)
 	unsigned long util = 0, max = 1;
 	unsigned int j;
 
+	/* 
+	 * OPTIMIZATION: Cluster-Wide Evaluation Caching
+	 * If the policy was evaluated less than 200 microseconds ago and 
+	 * no forced update is pending, reuse the stable cached next_freq 
+	 * to eliminate redundant multi-core polling overhead.
+	 */
+	if (likely(system_state >= SYSTEM_RUNNING) && 
+	    !sg_policy->need_freq_update &&
+	    (time - sg_policy->last_freq_update_time < 200 * NSEC_PER_USEC)) {
+		return sg_policy->next_freq;
+	}
+
 	for_each_cpu(j, policy->cpus) {
 		struct sugov_cpu *j_sg_cpu = &per_cpu(sugov_cpu, j);
 		unsigned long j_util, j_max;
