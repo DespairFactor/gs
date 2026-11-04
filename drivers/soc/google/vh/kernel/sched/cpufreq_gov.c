@@ -1044,17 +1044,21 @@ static void sugov_iowait_boost(struct sugov_cpu *sg_cpu, u64 time,
 		return;
 	}
 
-	/* 
-	 * OPTIMIZATION: Transient I/O Boost Damping
-	 * If the system is fully running and the CPU's current base utilization 
-	 * is very low (< 15% capacity), dampen the initial I/O boost floor to 
-	 * prevent background file reads from triggering unwarranted max-frequency spikes.
+/* 
+	 * OPTIMIZATION: Background vs Foreground I/O Boost Damping
+	 * If the current task is a background thread or kworker, severely dampen 
+	 * the I/O boost floor to prevent background I/O from pinning frequencies.
 	 */
-	if (likely(system_state >= SYSTEM_RUNNING) && 
-	    sg_cpu->util < (arch_scale_cpu_capacity(sg_cpu->cpu) >> 3)) {
-		sg_cpu->iowait_boost = IOWAIT_BOOST_MIN / 2;
+	if (likely(system_state >= SYSTEM_RUNNING)) {
+		struct task_struct *curr = cpu_rq(sg_cpu->cpu)->curr;
+		if (curr && (curr->flags & PF_KTHREAD || curr->prio >= 120)) {
+			sg_cpu->iowait_boost = IOWAIT_BOOST_MIN / 4;
+		} else if (sg_cpu->util < (arch_scale_cpu_capacity(sg_cpu->cpu) >> 3)) {
+			sg_cpu->iowait_boost = IOWAIT_BOOST_MIN / 2;
+		} else {
+			sg_cpu->iowait_boost = IOWAIT_BOOST_MIN;
+		}
 	} else {
-		/* First wakeup after heavy/active IO: start with minimum boost */
 		sg_cpu->iowait_boost = IOWAIT_BOOST_MIN;
 	}
 
