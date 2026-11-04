@@ -1153,10 +1153,17 @@ static inline bool sugov_cpu_is_busy(struct sugov_cpu *sg_cpu, u64 time) { retur
  * Make sugov_should_update_freq() ignore the rate limit when DL
  * has increased the utilization.
  */
-static inline void ignore_dl_rate_limit(struct sugov_cpu *sg_cpu)
+static void ignore_dl_rate_limit(struct sugov_cpu *sg_cpu)
 {
-	if (cpu_bw_dl(cpu_rq(sg_cpu->cpu)) > sg_cpu->bw_dl)
-		sg_cpu->sg_policy->limits_changed = true;
+	/* 
+	 * OPTIMIZATION: Deadline Rate-Limit Fast-Path Bypass
+	 * If no deadline tasks are scheduled on this runqueue, 
+	 * bypass runqueue pointer dereference and flag updates entirely.
+	 */
+	if (likely(!cpu_rq(sg_cpu->cpu)->dl.dl_nr_running))
+		return;
+
+	sg_cpu->sg_policy->need_freq_update = true;
 }
 
 #if IS_ENABLED(USE_UPDATE_SINGLE)
