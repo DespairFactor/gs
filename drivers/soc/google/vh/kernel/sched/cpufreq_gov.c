@@ -1300,11 +1300,34 @@ static void
 sugov_update_shared(struct update_util_data *hook, u64 time, unsigned int flags)
 {
 	struct sugov_cpu *sg_cpu = container_of(hook, struct sugov_cpu, update_util);
+	struct sugov_policy *sg_policy = sg_cpu->sg_policy;
 	unsigned int next_f, suspend_resume_boost;
 
-	raw_spin_lock(&sg_cpu->sg_policy->update_lock);
+	/* 
+	 * OPTIMIZATION: Lock-Free Rate-Limit Fast-Path Pre-Check
+	 * If the system is fully running, no forced updates are flagged, 
+	 * and we are strictly within the minimum rate-limit window, skip 
+	 * acquiring update_lock entirely to eliminate inter-core lock contention.
+	 */
+	if (likely(system_state >= SYSTEM_RUNNING) && 
+	    !(flags & SCHED_PIXEL_FORCE_UPDATE) &&
+	    !READ_ONCE(sg_policy->work_in_progress) &&
+	    !READ_ONCE(sg_policy->limits_changed)) {
+		s64 delta_ns = time - READ_ONCE(sg_policy->last_freq_update_time);
+		s64 min_rate = READ_ONCE(sg_policy->min_rate_limit_ns);
 
-	sg_cpu->sg_policy->limits_changed |= flags & SCHED_PIXEL_FORCE_UPDATE;
+		if (delta_ns < min_rate) {
+			/* Fast-path exit: apply iowait boost and bail out lock-free */
+			sugov_iowait_boost(sg_cpu, time, flags);
+			sg_cpu->last_update = time;
+			pmu_poll_defer_work(time);
+			return;
+		}
+	}
+
+	raw_spin_lock(&sg_policy->update_lock);
+
+	sg_policy->limits_changed |= flags & SCHED_PIXEL_FORCE_UPDATE;
 
 #if IS_ENABLED(CONFIG_UCLAMP_STATS)
 	update_uclamp_stats(sg_cpu->cpu, time);
@@ -1321,8 +1344,6 @@ sugov_update_shared(struct update_util_data *hook, u64 time, unsigned int flags)
 		bool busy;
 
 		next_f = sugov_next_freq_shared(sg_cpu, time);
-
-		/* Store current util as last evaluated for future surge/delta checks */
 		sg_cpu->last_evaluated_util = sg_cpu->util;
 
 		/* Limits may have changed, don't skip frequency update */
@@ -1381,11 +1402,12 @@ sugov_update_shared(struct update_util_data *hook, u64 time, unsigned int flags)
 
 #if IS_ENABLED(CONFIG_PIXEL_EM_FREQUENCY_SCALING)
 		scaling_freq_update(sg_cpu->sg_policy);
-	#endif
+#endif
 	}
 unlock:
 	raw_spin_unlock(&sg_cpu->sg_policy->update_lock);
 }
+
 static void sugov_work(struct kthread_work *work)
 {
 	struct sugov_policy *sg_policy = container_of(work, struct sugov_policy, work);
