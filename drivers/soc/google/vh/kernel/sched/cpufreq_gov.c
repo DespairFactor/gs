@@ -619,17 +619,25 @@ static bool sugov_up_down_rate_limit(struct sugov_policy *sg_policy, u64 time,
 
 	delta_ns = time - sg_policy->last_freq_update_time;
 
-	/* 
-	 * OPTIMIZATION: Proportional Up-Rate Scaling
-	 * If ramping up significantly, scale the required up-rate delay down 
-	 * proportionally based on the magnitude of the frequency increase, 
-	 * allowing massive surges to hit instantly without violating minor rate limits.
-	 */
 	if (next_freq > sg_policy->next_freq) {
 		unsigned long up_comp = sg_policy->up_rate_delay_ns * sg_policy->next_freq / next_freq;
 		if (delta_ns < up_comp)
 			return true;
 	} else {
+		/* 
+		 * OPTIMIZATION: Sustained Peak Frequency Hold
+		 * If operating at high frequencies (> 75% max) and attempting a 
+		 * minor downward drop (< 12.5% reduction), temporarily hold the frequency 
+		 * to prevent sawtooth jitter during rapid frame rendering or UI bursts.
+		 */
+		if (likely(system_state >= SYSTEM_RUNNING) && 
+		    sg_policy->next_freq > ((sg_policy->policy->cpuinfo.max_freq >> 2) * 3)) {
+			unsigned int freq_drop = sg_policy->next_freq - next_freq;
+			if (freq_drop < (sg_policy->policy->cpuinfo.max_freq >> 3) &&
+			    delta_ns < (sg_policy->down_rate_delay_ns << 1))
+				return true;
+		}
+
 		comp = sg_policy->down_rate_delay_ns * next_freq;
 		for (i = 0; i < sg_policy->down_rate_limit_scale_pow - 1; i++) {
 			comp = comp / sg_policy->next_freq * next_freq;
@@ -640,7 +648,6 @@ static bool sugov_up_down_rate_limit(struct sugov_policy *sg_policy, u64 time,
 
 	return false;
 }
-
 static bool sugov_update_next_freq(struct sugov_policy *sg_policy, u64 time,
 				   unsigned int next_freq)
 {
