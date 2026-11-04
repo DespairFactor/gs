@@ -22,28 +22,36 @@
  */
 static u64 decay_load(u64 val, u64 n)
 {
-	unsigned int local_n;
+    unsigned int local_n;
 
-	if (unlikely(n > LOAD_AVG_PERIOD * 63))
-		return 0;
+    /* 
+     * OPTIMIZATION: Zero-Period Early Exit
+     * If no PELT periods have elapsed (n == 0), decay math is a 
+     * no-op. Bypass shifts, modulo, and table lookups entirely.
+     */
+    if (unlikely(!n))
+        return val;
 
-	/* after bounds checking we can collapse to 32-bit */
-	local_n = n;
+    if (unlikely(n > LOAD_AVG_PERIOD * 63))
+        return 0;
 
-	/*
-	 * As y^PERIOD = 1/2, we can combine
-	 *    y^n = 1/2^(n/PERIOD) * y^(n%PERIOD)
-	 * With a look-up table which covers y^n (n<PERIOD)
-	 *
-	 * To achieve constant time decay_load.
-	 */
-	if (unlikely(local_n >= LOAD_AVG_PERIOD)) {
-		val >>= local_n / LOAD_AVG_PERIOD;
-		local_n %= LOAD_AVG_PERIOD;
-	}
+    /* after bounds checking we can collapse to 32-bit */
+    local_n = n;
 
-	val = mul_u64_u32_shr(val, runnable_avg_yN_inv[local_n], 32);
-	return val;
+    /*
+     * As y^PERIOD = 1/2, we can combine
+     *   y^n = 1/2^(n/PERIOD) * y^(n%PERIOD)
+     * With a look-up table which covers y^n (n<PERIOD)
+     *
+     * To achieve constant time decay_load.
+     */
+    if (unlikely(local_n >= LOAD_AVG_PERIOD)) {
+        val >>= local_n / LOAD_AVG_PERIOD;
+        local_n %= LOAD_AVG_PERIOD;
+    }
+
+    val = mul_u64_u32_shr(val, runnable_avg_yN_inv[local_n], 32);
+    return val;
 }
 
 static u32 __accumulate_pelt_segments(u64 periods, u32 d1, u32 d3)
