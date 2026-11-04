@@ -348,7 +348,6 @@ static inline void sugov_update_response_time_mult(struct sugov_policy *sg_polic
 unsigned long __always_inline
 apply_dvfs_headroom(unsigned long util, int cpu, bool tapered)
 {
-
 	if (static_branch_likely(&auto_dvfs_headroom_enable)) {
 		u64 limit = per_cpu(dvfs_update_delay, cpu);
 
@@ -366,13 +365,18 @@ apply_dvfs_headroom(unsigned long util, int cpu, bool tapered)
 		if (util >= capacity)
 			return util;
 
-		/*
-		 * Taper the boosting at e top end as these are expensive and
-		 * we don't need that much of a big headroom as we approach max
-		 * capacity
-		 *
-		 */
 		headroom = (capacity - util);
+
+		/*
+		 * OPTIMIZATION: Non-Linear Quadratic Tapering at Top-End
+		 * As utilization approaches the top 25% of capacity, apply a 
+		 * quadratic reduction factor to headroom to suppress thermal 
+		 * spikes and excessive OPP scaling under heavy sustained load.
+		 */
+		if (util > (capacity - (capacity >> 2))) {
+			headroom = (headroom * headroom) / capacity;
+		}
+
 		/* formula: headroom * (1.X - 1) == headroom * 0.X */
 		headroom = headroom * (sched_dvfs_headroom[cpu] - SCHED_CAPACITY_SCALE) >> SCHED_CAPACITY_SHIFT;
 		return util + headroom;
