@@ -948,17 +948,11 @@ unsigned long schedutil_cpu_util_pixel_mod(int cpu, unsigned long util_cfs,
 	return min(max, util);
 }
 
-static void __always_inline
-sugov_get_util(struct sugov_cpu *sg_cpu)
+static void sugov_get_util(struct sugov_cpu *sg_cpu)
 {
-	struct rq *rq = cpu_rq(sg_cpu->cpu);
-	unsigned long max = arch_scale_cpu_capacity(sg_cpu->cpu);
+	unsigned long util = sched_cpu_util(sg_cpu->cpu, &sg_cpu->max);
 
-	sg_cpu->max = max;
-	sg_cpu->bw_dl = cpu_bw_dl(rq);
-
-	sg_cpu->util = schedutil_cpu_util_pixel_mod(sg_cpu->cpu,
-			cpu_util_cfs_group_mod(sg_cpu->cpu), max, FREQUENCY_UTIL, NULL);
+	sg_cpu->util = util;
 }
 
 /**
