@@ -145,6 +145,18 @@ static int find_least_loaded_cpu(struct task_struct *p, struct cpumask *lowest_m
 	if (cpumask_weight(lowest_mask) == 1)
 		return cpumask_first(lowest_mask);
 
+	/* 
+	 * OPTIMIZATION: Fast-Path Previous CPU Return
+	 * If prev_cpu is in lowest_mask, is idle, and fits capacity, 
+	 * prefer it instantly to avoid full core scan overhead.
+	 */
+	if (cpumask_test_cpu(prev_cpu, lowest_mask)) {
+		bool p_fits, p_fits_orig;
+		rt_task_fits_capacity(p, prev_cpu, &p_fits, &p_fits_orig);
+		if (available_idle_cpu(prev_cpu) && (p_fits || p_fits_orig))
+			return prev_cpu;
+	}
+
 	rcu_read_lock();
 
 	cpumask_clear(backup_mask);
@@ -155,16 +167,15 @@ static int find_least_loaded_cpu(struct task_struct *p, struct cpumask *lowest_m
 
 	for_each_cpu(cpu, lowest_mask) {
 		is_idle = available_idle_cpu(cpu);
-		exit_lat[cpu] = C1_EXIT_LATENCY; // If cpu is not idle, use C1_EXIT_LATENCY
+		exit_lat[cpu] = C1_EXIT_LATENCY;
 		capacity[cpu] = arch_scale_cpu_capacity(cpu);
 		cpu_importance[cpu] = READ_ONCE(cpu_rq(cpu)->uclamp[UCLAMP_MIN].value) +
-				 READ_ONCE(cpu_rq(cpu)->uclamp[UCLAMP_MAX].value);
+				   READ_ONCE(cpu_rq(cpu)->uclamp[UCLAMP_MAX].value);
 		rq_util_min = uclamp_rq_get(cpu_rq(cpu), UCLAMP_MIN);
 		rq_util_max = uclamp_rq_get(cpu_rq(cpu), UCLAMP_MAX);
 
 		if (is_idle) {
 			idle = idle_get_state(cpu_rq(cpu));
-
 			if (idle)
 				exit_lat[cpu] = idle->exit_latency;
 		}
@@ -180,7 +191,6 @@ static int find_least_loaded_cpu(struct task_struct *p, struct cpumask *lowest_m
 
 		rt_task_fits_capacity(p, cpu, &task_fits[cpu], &task_fits_original[cpu]);
 
-
 		// Make cpus in CPD state the least preferred
 		if (is_idle && !get_cluster_enabled(pixel_cpu_to_cluster[cpu])) {
 			cpu_importance[cpu] = UINT_MAX;
@@ -191,8 +201,8 @@ static int find_least_loaded_cpu(struct task_struct *p, struct cpumask *lowest_m
 			cpu_importance[cpu] = UINT_MAX;
 
 		trace_sched_cpu_util_rt(cpu, capacity[cpu], capacity_of(cpu), util[cpu],
-					exit_lat[cpu], cpu_importance[cpu], task_fits[cpu],
-					task_fits_original[cpu], is_idle);
+				 exit_lat[cpu], cpu_importance[cpu], task_fits[cpu],
+				 task_fits_original[cpu], is_idle);
 
 		// To prefer idle cpu than non-idle cpu
 		if (is_idle)
@@ -272,10 +282,10 @@ static int find_least_loaded_cpu(struct task_struct *p, struct cpumask *lowest_m
 out:
 	if (trace_sched_find_least_loaded_cpu_enabled())
 		trace_sched_find_least_loaded_cpu(p, get_vendor_group(p),
-						  uclamp_eff_value_pixel_mod(p, UCLAMP_MIN),
-						  uclamp_eff_value_pixel_mod(p, UCLAMP_MAX),
-						  get_prefer_high_cap(p), prev_cpu, best_cpu,
-						  *lowest_mask->bits,  *backup_mask->bits);
+					 uclamp_eff_value_pixel_mod(p, UCLAMP_MIN),
+					 uclamp_eff_value_pixel_mod(p, UCLAMP_MAX),
+					 get_prefer_high_cap(p), prev_cpu, best_cpu,
+					 *lowest_mask->bits,  *backup_mask->bits);
 
 	return best_cpu;
 }
