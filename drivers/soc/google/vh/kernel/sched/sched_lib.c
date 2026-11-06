@@ -128,31 +128,36 @@ int set_prefer_idle_task_name(void)
 	char *tok, *str;
 	struct task_struct *p, *t;
 	int ret = -1;
+	static char last_prefer_idle_name[LIB_PATH_LENGTH] = "";
 
 	spin_lock(&prefer_idle_task_name_lock);
 	strscpy(tmp, prefer_idle_task_name, sizeof(tmp));
 	spin_unlock(&prefer_idle_task_name_lock);
 
-	if (*tmp != '\0') {
-		str = tmp;
+	if (*tmp == '\0')
+		return -1;
 
-		while (1) {
-			tok = strsep(&str, ",");
+	/* OPTIMIZATION: Skip redundant global thread walk if string hasn't changed */
+	if (!strncmp(last_prefer_idle_name, tmp, sizeof(tmp)))
+		return 0;
 
-			if (tok == NULL)
-				break;
+	strscpy(last_prefer_idle_name, tmp, sizeof(tmp));
+	str = tmp;
 
-			rcu_read_lock();
-			for_each_process_thread(p, t) {
-				if (strstr(t->comm, tok) != NULL) {
-					set_bit(SCHED_QOS_PREFER_IDLE_BIT,
-					  &get_vendor_task_struct(t)->sched_qos_user_defined_flag);
-					ret = 0;
-					break;
-				}
+	while (1) {
+		tok = strsep(&str, ",");
+		if (tok == NULL)
+			break;
+
+		rcu_read_lock();
+		for_each_process_thread(p, t) {
+			if (strstr(t->comm, tok) != NULL) {
+				set_bit(SCHED_QOS_PREFER_IDLE_BIT,
+					&get_vendor_task_struct(t)->sched_qos_user_defined_flag);
+				ret = 0;
 			}
-			rcu_read_unlock();
 		}
+		rcu_read_unlock();
 	}
 
 	return ret;
