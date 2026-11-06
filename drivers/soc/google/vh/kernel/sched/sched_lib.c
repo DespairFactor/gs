@@ -100,6 +100,7 @@ void rvh_set_task_comm_pixel_mod(void *data, struct task_struct *p, bool exec)
 	char tmp[LIB_PATH_LENGTH];
 	char *tok, *str;
 	unsigned long flags;
+	size_t comm_len = strlen(p->comm);
 
 	spin_lock_irqsave(&priority_task_name_lock, flags);
 	strscpy(tmp, priority_task_name, sizeof(tmp));
@@ -112,6 +113,10 @@ void rvh_set_task_comm_pixel_mod(void *data, struct task_struct *p, bool exec)
 
 			if (tok == NULL)
 				break;
+
+			/* OPTIMIZATION: Fast-path string length guard */
+			if (comm_len < strlen(tok))
+				continue;
 
 			if (strstr(p->comm, tok) != NULL) {
 				boost_priority_task(p);
