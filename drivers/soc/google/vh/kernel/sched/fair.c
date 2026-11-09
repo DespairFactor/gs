@@ -1696,542 +1696,566 @@ static inline bool should_spread_nr_running(struct task_struct *p, struct rq *rq
  */
 
 int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu,
-		cpumask_t *valid_mask)
+        cpumask_t *valid_mask)
 {
-	struct root_domain *rd;
-	struct perf_domain *pd;
-	cpumask_t cm[CC_MAX] = { [0 ... CC_MAX-1] = {CPU_BITS_NONE} };
-	cpumask_t candidates = { CPU_BITS_NONE }, candidates_temp = { CPU_BITS_NONE };
-	int i, weight, best_energy_cpu = -1, this_cpu = smp_processor_id();
-	long cur_energy, best_energy = LONG_MAX;
-	unsigned long p_util_min = uclamp_is_used() ? uclamp_eff_value_pixel_mod(p, UCLAMP_MIN) : 0;
-	unsigned long p_util_max = uclamp_is_used() ? uclamp_eff_value_pixel_mod(p, UCLAMP_MAX) : 1024;
-	unsigned long p_util_max_orig = p_util_max;
-	unsigned long spare_cap, target_max_spare_cap = 0;
-	unsigned long task_importance = SCHED_CAPACITY_SCALE;
-	unsigned int exit_lat, pd_best_exit_lat, best_exit_lat, best_nr_running;
-	bool is_idle, task_fits, util_fits;
-	bool idle_target_found = false, importance_target_found = false;
-	bool prefer_idle = get_prefer_idle(p);
-	unsigned long capacity, wake_util, next_util, cpu_importance, pd_least_cpu_importantce;
+    struct root_domain *rd;
+    struct perf_domain *pd;
+    cpumask_t cm[CC_MAX] = { [0 ... CC_MAX-1] = {CPU_BITS_NONE} };
+    cpumask_t candidates = { CPU_BITS_NONE }, candidates_temp = { CPU_BITS_NONE };
+    int i, weight, best_energy_cpu = -1, this_cpu = smp_processor_id();
+    long cur_energy, best_energy = LONG_MAX;
+    unsigned long p_util_min = uclamp_is_used() ? uclamp_eff_value_pixel_mod(p, UCLAMP_MIN) : 0;
+    unsigned long p_util_max = uclamp_is_used() ? uclamp_eff_value_pixel_mod(p, UCLAMP_MAX) : 1024;
+    unsigned long p_util_max_orig = p_util_max;
+    unsigned long spare_cap, target_max_spare_cap = 0;
+    unsigned long task_importance = SCHED_CAPACITY_SCALE;
+    unsigned int exit_lat, pd_best_exit_lat, best_exit_lat, best_nr_running;
+    bool is_idle, task_fits, util_fits;
+    bool idle_target_found = false, importance_target_found = false;
+    bool prefer_idle = get_prefer_idle(p);
+    unsigned long capacity, wake_util, next_util, cpu_importance, pd_least_cpu_importantce;
 #if IS_ENABLED(CONFIG_USE_GROUP_THROTTLE)
-	bool group_overutilize;
-	unsigned long group_capacity, wake_group_util;
+    bool group_overutilize;
+    unsigned long group_capacity, wake_group_util;
 #endif
-	unsigned long pd_max_spare_cap, pd_max_unimportant_spare_cap, pd_max_packing_spare_cap, pd_max_spare_cap_running_rt, pd_max_spare_cap_nr_running;
-	int pd_max_spare_cap_cpu, pd_best_idle_cpu, pd_most_unimportant_cpu, pd_best_packing_cpu, pd_max_spare_cap_running_rt_cpu;
-	int most_spare_cap_cpu = -1, unimportant_max_spare_cap_cpu = -1, idle_max_cap_cpu = -1;
-	int least_loaded_cpu = -1;
-	struct cpuidle_state *idle_state;
-	unsigned long unimportant_max_spare_cap = 0, idle_max_cap = 0;
-	unsigned long max_spare_cap_nr_running = UINT_MAX;
-	unsigned long cfs_load, min_load = ULONG_MAX;
-	bool prefer_fit = false;
-	const cpumask_t *preferred_idle_mask;
-	unsigned long task_util_capped = min(task_util_est(p), p_util_max);
+    unsigned long pd_max_spare_cap, pd_max_unimportant_spare_cap, pd_max_packing_spare_cap, pd_max_spare_cap_running_rt, pd_max_spare_cap_nr_running;
+    int pd_max_spare_cap_cpu, pd_best_idle_cpu, pd_most_unimportant_cpu, pd_best_packing_cpu, pd_max_spare_cap_running_rt_cpu;
+    int most_spare_cap_cpu = -1, unimportant_max_spare_cap_cpu = -1, idle_max_cap_cpu = -1;
+    int least_loaded_cpu = -1;
+    struct cpuidle_state *idle_state;
+    unsigned long unimportant_max_spare_cap = 0, idle_max_cap = 0;
+    unsigned long max_spare_cap_nr_running = UINT_MAX;
+    unsigned long cfs_load, min_load = ULONG_MAX;
+    bool prefer_fit = false;
+    const cpumask_t *preferred_idle_mask;
+    unsigned long task_util_capped = min(task_util_est(p), p_util_max);
 
-	rd = cpu_rq(this_cpu)->rd;
+    rd = cpu_rq(this_cpu)->rd;
 
-	rcu_read_lock();
-	pd = rcu_dereference(rd->pd);
-	if (!pd)
-		goto out;
+    p_util_min = max(p_util_min, get_vendor_task_struct(p)->iowait_boost);
 
-	p_util_min = max(p_util_min, get_vendor_task_struct(p)->iowait_boost);
+    /*
+     * FAST-PATH BYPASS:
+     * Check if prev_cpu is already optimal (active, allowed, idle, fits capacity,
+     * meets preferred idle mask constraints, and has minimal exit latency).
+     * If so, immediately return prev_cpu to eliminate full energy scan overhead.
+     */
+    if (cpu_active(prev_cpu) &&
+        cpumask_test_cpu(prev_cpu, valid_mask ? valid_mask : p->cpus_ptr) &&
+        cpu_is_idle(prev_cpu) &&
+        task_fits_capacity(p, prev_cpu) &&
+        check_preferred_idle_mask(p, prev_cpu) &&
+        !cpumask_test_cpu(prev_cpu, get_group_cfs_skip_mask(p))) {
 
-	if (get_prefer_fit(p) || get_auto_prefer_fit(p))
-		prefer_fit = true;
+        rcu_read_lock();
+        idle_state = idle_get_state(cpu_rq(prev_cpu));
+        exit_lat = sched_cpu_idle(prev_cpu) ? 1 : (idle_state ? idle_state->exit_latency : 1);
+        rcu_read_unlock();
 
-	for (; pd; pd = pd->next) {
-		unsigned long util_min = p_util_min, util_max = p_util_max_orig;
-		unsigned long rq_util_min, rq_util_max;
-		pd_max_spare_cap_running_rt = 0;
-		pd_max_spare_cap = 0;
-		pd_max_spare_cap_nr_running = UINT_MAX;
-		pd_max_packing_spare_cap = 0;
-		pd_max_unimportant_spare_cap = 0;
-		pd_best_exit_lat = UINT_MAX;
-		pd_max_spare_cap_running_rt_cpu = -1;
-		pd_max_spare_cap_cpu = -1;
-		pd_best_idle_cpu = -1;
-		pd_most_unimportant_cpu = -1;
-		pd_best_packing_cpu = -1;
-		pd_least_cpu_importantce = SCHED_CAPACITY_SCALE << 2;
-		unsigned long rq_nr_running = 0;
+        if (exit_lat <= C1_EXIT_LATENCY) {
+            trace_sched_find_energy_efficient_cpu(p, prefer_idle, prefer_fit,
+                                                 task_importance, cm, prev_cpu);
+            return prev_cpu;
+        }
+    }
 
-		for_each_cpu_and(i, perf_domain_span(pd), valid_mask ? valid_mask : p->cpus_ptr) {
-			if (i >= pixel_cpu_num)
-				break;
+    rcu_read_lock();
+    pd = rcu_dereference(rd->pd);
+    if (!pd)
+        goto out;
 
-			if (!cpu_active(i))
-				continue;
+    if (get_prefer_fit(p) || get_auto_prefer_fit(p))
+        prefer_fit = true;
 
-			capacity = capacity_of(i);
-			is_idle = cpu_is_idle(i);
-			cpu_importance = READ_ONCE(cpu_rq(i)->uclamp[UCLAMP_MIN].value) +
-					   READ_ONCE(cpu_rq(i)->uclamp[UCLAMP_MAX].value);
-			next_util = cpu_util_next(i, p, i);
+    for (; pd; pd = pd->next) {
+        unsigned long util_min = p_util_min, util_max = p_util_max_orig;
+        unsigned long rq_util_min, rq_util_max;
+        pd_max_spare_cap_running_rt = 0;
+        pd_max_spare_cap = 0;
+        pd_max_spare_cap_nr_running = UINT_MAX;
+        pd_max_packing_spare_cap = 0;
+        pd_max_unimportant_spare_cap = 0;
+        pd_best_exit_lat = UINT_MAX;
+        pd_max_spare_cap_running_rt_cpu = -1;
+        pd_max_spare_cap_cpu = -1;
+        pd_best_idle_cpu = -1;
+        pd_most_unimportant_cpu = -1;
+        pd_best_packing_cpu = -1;
+        pd_least_cpu_importantce = SCHED_CAPACITY_SCALE << 2;
+        unsigned long rq_nr_running = 0;
 
-			/*
-			 * When push lb is enabled be more stringent to allow
-			 * better distribution of tasks.
-			 */
-			if (static_branch_likely(&enable_ptick))
-				wake_util = next_util;
-			else
-				wake_util = cpu_util_without(i, p, capacity);
+        for_each_cpu_and(i, perf_domain_span(pd), valid_mask ? valid_mask : p->cpus_ptr) {
+            if (i >= pixel_cpu_num)
+                break;
+
+            if (!cpu_active(i))
+                continue;
+
+            capacity = capacity_of(i);
+            is_idle = cpu_is_idle(i);
+            cpu_importance = READ_ONCE(cpu_rq(i)->uclamp[UCLAMP_MIN].value) +
+                     READ_ONCE(cpu_rq(i)->uclamp[UCLAMP_MAX].value);
+            next_util = cpu_util_next(i, p, i);
+
+            /*
+             * When push lb is enabled be more stringent to allow
+             * better distribution of tasks.
+             */
+            if (static_branch_likely(&enable_ptick))
+                wake_util = next_util;
+            else
+                wake_util = cpu_util_without(i, p, capacity);
 
 #if IS_ENABLED(CONFIG_USE_GROUP_THROTTLE)
-			group_capacity = cap_scale(get_task_group_throttle(p),
-					   arch_scale_cpu_capacity(i));
+            group_capacity = cap_scale(get_task_group_throttle(p),
+                       arch_scale_cpu_capacity(i));
 #if IS_ENABLED(CONFIG_USE_VENDOR_GROUP_UTIL)
-			wake_group_util = get_group_util(i, p, group_capacity, true);
-			group_overutilize = group_overutilized(i, p, wake_group_util);
+            wake_group_util = get_group_util(i, p, group_capacity, true);
+            group_overutilize = group_overutilized(i, p, wake_group_util);
 #else
-			wake_group_util = group_util_without(i, p, group_capacity);
-			group_overutilize = group_overutilized(i, task_group(p), wake_group_util);
+            wake_group_util = group_util_without(i, p, group_capacity);
+            group_overutilize = group_overutilized(i, task_group(p), wake_group_util);
 #endif
-			spare_cap = min_t(unsigned long, capacity - wake_util,
-					  group_capacity - wake_group_util);
+            spare_cap = min_t(unsigned long, capacity - wake_util,
+                      group_capacity - wake_group_util);
 #else
-			spare_cap = capacity - wake_util;
+            spare_cap = capacity - wake_util;
 #endif
-			task_fits = task_fits_capacity(p, i);
-			exit_lat = 1;
+            task_fits = task_fits_capacity(p, i);
+            exit_lat = 1;
 
-			rq_nr_running = cpu_rq(i)->nr_running;
-			if (task_current(cpu_rq(i), p) || (task_on_rq_queued(p) && i == prev_cpu))
-				rq_nr_running--;
+            rq_nr_running = cpu_rq(i)->nr_running;
+            if (task_current(cpu_rq(i), p) || (task_on_rq_queued(p) && i == prev_cpu))
+                rq_nr_running--;
 
-			if (is_idle) {
-				idle_state = idle_get_state(cpu_rq(i));
-				if (idle_state)
-					exit_lat = idle_state->exit_latency;
-			}
+            if (is_idle) {
+                idle_state = idle_get_state(cpu_rq(i));
+                if (idle_state)
+                    exit_lat = idle_state->exit_latency;
+            }
 
 #if IS_ENABLED(CONFIG_USE_GROUP_THROTTLE)
-			if (trace_sched_cpu_util_cfs_enabled())
-				trace_sched_cpu_util_cfs(i, is_idle, exit_lat, cpu_importance,
-							 cpu_util(i), capacity, wake_util,
-							 group_capacity, wake_group_util, spare_cap,
-							 task_fits, group_overutilize);
+            if (trace_sched_cpu_util_cfs_enabled())
+                trace_sched_cpu_util_cfs(i, is_idle, exit_lat, cpu_importance,
+                           cpu_util(i), capacity, wake_util,
+                           group_capacity, wake_group_util, spare_cap,
+                           task_fits, group_overutilize);
 #else
-			if (trace_sched_cpu_util_cfs_enabled())
-				trace_sched_cpu_util_cfs(i, is_idle, exit_lat, cpu_importance,
-							 cpu_util(i), capacity, wake_util, capacity,
-							 wake_util, spare_cap, task_fits, false);
+            if (trace_sched_cpu_util_cfs_enabled())
+                trace_sched_cpu_util_cfs(i, is_idle, exit_lat, cpu_importance,
+                           cpu_util(i), capacity, wake_util, capacity,
+                           wake_util, spare_cap, task_fits, false);
 #endif
 
-			/*
-			 * Consider auto_uclamp_max based on placing the task
-			 * on the ith cpu
-			 */
-			p_util_max = min(p_util_max_orig, get_eff_auto_uclamp_max(p, i));
-			util_max = p_util_max;
+            /*
+             * Consider auto_uclamp_max based on placing the task
+             * on the ith cpu
+             */
+            p_util_max = min(p_util_max_orig, get_eff_auto_uclamp_max(p, i));
+            util_max = p_util_max;
 
-			task_importance = ((p->prio <= DEFAULT_PRIO) ? p_util_min : 0) + p_util_max;
+            task_importance = ((p->prio <= DEFAULT_PRIO) ? p_util_min : 0) + p_util_max;
 
-			/*
-			 * Skip CPUs that cannot satisfy the capacity request.
-			 * IOW, placing the task there would make the CPU
-			 * overutilized. Take uclamp into account to see how
-			 * much capacity we can get out of the CPU; this is
-			 * aligned with sched_cpu_util().
-			 */
-			if (uclamp_is_used() && !uclamp_rq_is_idle(cpu_rq(i))) {
-				/*
-				 * Open code uclamp_rq_util_with() except for
-				 * the clamp() part. Ie: apply max aggregation
-				 * only. util_fits_cpu() logic requires to
-				 * operate on non clamped util but must use the
-				 * max-aggregated uclamp_{min, max}.
-				 */
-				rq_util_min = uclamp_rq_get(cpu_rq(i), UCLAMP_MIN);
-				rq_util_max = uclamp_rq_get(cpu_rq(i), UCLAMP_MAX);
+            /*
+             * Skip CPUs that cannot satisfy the capacity request.
+             * IOW, placing the task there would make the CPU
+             * overutilized. Take uclamp into account to see how
+             * much capacity we can get out of the CPU; this is
+             * aligned with sched_cpu_util().
+             */
+            if (uclamp_is_used() && !uclamp_rq_is_idle(cpu_rq(i))) {
+                /*
+                 * Open code uclamp_rq_util_with() except for
+                 * the clamp() part. Ie: apply max aggregation
+                 * only. util_fits_cpu() logic requires to
+                 * operate on non clamped util but must use the
+                 * max-aggregated uclamp_{min, max}.
+                 */
+                rq_util_min = uclamp_rq_get(cpu_rq(i), UCLAMP_MIN);
+                rq_util_max = uclamp_rq_get(cpu_rq(i), UCLAMP_MAX);
 
-				util_min = max(rq_util_min, p_util_min);
-				util_max = max(rq_util_max, p_util_max);
-			}
+                util_min = max(rq_util_min, p_util_min);
+                util_max = max(rq_util_max, p_util_max);
+            }
 
-			util_fits = util_fits_cpu(next_util, util_min, util_max, i);
-			if (static_key_enabled(&enable_spread_nr_running))
-				util_fits &= !should_spread_nr_running(p, cpu_rq(i), rq_nr_running);
+            util_fits = util_fits_cpu(next_util, util_min, util_max, i);
+            if (static_key_enabled(&enable_spread_nr_running))
+                util_fits &= !should_spread_nr_running(p, cpu_rq(i), rq_nr_running);
 
-			cfs_load = cpu_load(cpu_rq(i));
-			if (cfs_load < min_load) {
-				min_load = cfs_load;
-				least_loaded_cpu = i;
-			}
+            cfs_load = cpu_load(cpu_rq(i));
+            if (cfs_load < min_load) {
+                min_load = cfs_load;
+                least_loaded_cpu = i;
+            }
 
-			if (prefer_idle) {
-				/*
-				 * For a cluster, the energy computation result will be the same for
-				 * idle cpus on that cluster, so we could save some computation by
-				 * just choosing 1 idle cpu for each cluster.
-				 * If there are multiple idle cpus, compare their c states (exit
-				 * latency).
-				 */
-				if (is_idle) {
-					/* The first idle cpu will always fall into this case. */
-					if (exit_lat < pd_best_exit_lat) {
-						pd_best_idle_cpu = i;
-						pd_best_exit_lat = exit_lat;
-					} else if (exit_lat == pd_best_exit_lat) {
-						/*
-						 * A simple randomization, by choosing the first or
-						 * the last cpu if pd_best_idle_cpu != prev_cpu.
-						 */
-						if (i == prev_cpu ||
-						    (pd_best_idle_cpu != prev_cpu && this_cpu % 2))
-							pd_best_idle_cpu = i;
-					}
+            if (prefer_idle) {
+                /*
+                 * For a cluster, the energy computation result will be the same for
+                 * idle cpus on that cluster, so we could save some computation by
+                 * just choosing 1 idle cpu for each cluster.
+                 * If there are multiple idle cpus, compare their c states (exit
+                 * latency).
+                 */
+                if (is_idle) {
+                    /* The first idle cpu will always fall into this case. */
+                    if (exit_lat < pd_best_exit_lat) {
+                        pd_best_idle_cpu = i;
+                        pd_best_exit_lat = exit_lat;
+                    } else if (exit_lat == pd_best_exit_lat) {
+                        /*
+                         * A simple randomization, by choosing the first or
+                         * the last cpu if pd_best_idle_cpu != prev_cpu.
+                         */
+                        if (i == prev_cpu ||
+                            (pd_best_idle_cpu != prev_cpu && this_cpu % 2))
+                            pd_best_idle_cpu = i;
+                    }
 
-					idle_target_found = true;
+                    idle_target_found = true;
 
-					/* Only keep the highest cpu */
-					if (pd_best_idle_cpu > idle_max_cap_cpu) {
-						idle_max_cap_cpu = pd_best_idle_cpu;
-						idle_max_cap = capacity;
-					}
-				}
+                    /* Only keep the highest cpu */
+                    if (pd_best_idle_cpu > idle_max_cap_cpu) {
+                        idle_max_cap_cpu = pd_best_idle_cpu;
+                        idle_max_cap = capacity;
+                    }
+                }
 
-				if (idle_target_found)
-					continue;
+                if (idle_target_found)
+                    continue;
 
-				if (prefer_fit && task_fits && cpu_curr(i)->prio < MAX_RT_PRIO) {
-					if (spare_cap >= pd_max_spare_cap_running_rt) {
-						pd_max_spare_cap_running_rt = spare_cap;
-						pd_max_spare_cap_running_rt_cpu = i;
-					}
-					continue;
-				}
+                if (prefer_fit && task_fits && cpu_curr(i)->prio < MAX_RT_PRIO) {
+                    if (spare_cap >= pd_max_spare_cap_running_rt) {
+                        pd_max_spare_cap_running_rt = spare_cap;
+                        pd_max_spare_cap_running_rt_cpu = i;
+                    }
+                    continue;
+                }
 
-				/* Find an unimportant cpu. */
-				if (task_importance > cpu_importance) {
-					/* Choose the least important cpu*/
-					if (cpu_importance < pd_least_cpu_importantce) {
-						pd_least_cpu_importantce = cpu_importance;
-						pd_max_unimportant_spare_cap = spare_cap;
-						pd_most_unimportant_cpu = i;
-						importance_target_found = true;
+                /* Find an unimportant cpu. */
+                if (task_importance > cpu_importance) {
+                    /* Choose the least important cpu*/
+                    if (cpu_importance < pd_least_cpu_importantce) {
+                        pd_least_cpu_importantce = cpu_importance;
+                        pd_max_unimportant_spare_cap = spare_cap;
+                        pd_most_unimportant_cpu = i;
+                        importance_target_found = true;
 
-						/* Only keep the highest cpu */
-						if (i > unimportant_max_spare_cap_cpu) {
-							unimportant_max_spare_cap_cpu = i;
-							unimportant_max_spare_cap = spare_cap;
-						}
-					/*
-					 * If cpu importance is the same, choose the one with higher
-					 * spare capacity.
-					 */
-					} else if (cpu_importance == pd_least_cpu_importantce) {
-						if (spare_cap >= pd_max_unimportant_spare_cap) {
-							pd_max_unimportant_spare_cap = spare_cap;
-							pd_most_unimportant_cpu = i;
-							importance_target_found = true;
+                        /* Only keep the highest cpu */
+                        if (i > unimportant_max_spare_cap_cpu) {
+                            unimportant_max_spare_cap_cpu = i;
+                            unimportant_max_spare_cap = spare_cap;
+                        }
+                    /*
+                     * If cpu importance is the same, choose the one with higher
+                     * spare capacity.
+                     */
+                    } else if (cpu_importance == pd_least_cpu_importantce) {
+                        if (spare_cap >= pd_max_unimportant_spare_cap) {
+                            pd_max_unimportant_spare_cap = spare_cap;
+                            pd_most_unimportant_cpu = i;
+                            importance_target_found = true;
 
-							/* Only keep the highest cpu */
-							if (i > unimportant_max_spare_cap_cpu) {
-								unimportant_max_spare_cap_cpu = i;
-								unimportant_max_spare_cap =
-									spare_cap;
-							}
-						}
-					}
-				}
+                            /* Only keep the highest cpu */
+                            if (i > unimportant_max_spare_cap_cpu) {
+                                unimportant_max_spare_cap_cpu = i;
+                                unimportant_max_spare_cap =
+                                    spare_cap;
+                            }
+                        }
+                    }
+                }
 
-				if (importance_target_found)
-					continue;
+                if (importance_target_found)
+                    continue;
 
-				/*
-				 * Make srue prefer_fit task could find a candidate in high capacity
-				 * clusters.
-				 */
+                /*
+                 * Make sure prefer_fit task could find a candidate in high capacity
+                 * clusters.
+                 */
 #if IS_ENABLED(CONFIG_USE_GROUP_THROTTLE)
-				if (!prefer_fit &&
-				    (group_overutilize || !util_fits))
-					continue;
+                if (!prefer_fit &&
+                    (group_overutilize || !util_fits))
+                    continue;
 #else
-				if (!prefer_fit && !util_fits)
-					continue;
+                if (!prefer_fit && !util_fits)
+                    continue;
 #endif
 
-				if (prefer_fit && !task_fits)
-					continue;
+                if (prefer_fit && !task_fits)
+                    continue;
 
-				/* find max spare capacity cpu, used as backup */
-				if (spare_cap > target_max_spare_cap) {
-					target_max_spare_cap = spare_cap;
-					cpumask_clear(&cm[MAX_SPARE_CAP]);
-					cpumask_set_cpu(i, &cm[MAX_SPARE_CAP]);
-				} else if (spare_cap == target_max_spare_cap) {
-					/*
-					 * Pick the CPU with least amount of
-					 * running tasks first.
-					 */
-					if (rq_nr_running < max_spare_cap_nr_running) {
-						max_spare_cap_nr_running = rq_nr_running;
-						cpumask_clear(&cm[MAX_SPARE_CAP]);
-						cpumask_set_cpu(i, &cm[MAX_SPARE_CAP]);
-					} else if (rq_nr_running == max_spare_cap_nr_running) {
+                /* find max spare capacity cpu, used as backup */
+                if (spare_cap > target_max_spare_cap) {
+                    target_max_spare_cap = spare_cap;
+                    cpumask_clear(&cm[MAX_SPARE_CAP]);
+                    cpumask_set_cpu(i, &cm[MAX_SPARE_CAP]);
+                } else if (spare_cap == target_max_spare_cap) {
+                    /*
+                     * Pick the CPU with least amount of
+                     * running tasks first.
+                     */
+                    if (rq_nr_running < max_spare_cap_nr_running) {
+                        max_spare_cap_nr_running = rq_nr_running;
+                        cpumask_clear(&cm[MAX_SPARE_CAP]);
+                        cpumask_set_cpu(i, &cm[MAX_SPARE_CAP]);
+                    } else if (rq_nr_running == max_spare_cap_nr_running) {
 
-						int most_spare_cap_cpu = cpumask_any(&cm[MAX_SPARE_CAP]);
-						unsigned long cap_i, cap_spare;
+                        int most_spare_cap_cpu = cpumask_any(&cm[MAX_SPARE_CAP]);
+                        unsigned long cap_i, cap_spare;
 
-						cap_i = capacity_of(i);
-						cap_spare = capacity_of(most_spare_cap_cpu);
+                        cap_i = capacity_of(i);
+                        cap_spare = capacity_of(most_spare_cap_cpu);
 
-						if (cap_i > cap_spare ||
-						    (cap_i == cap_spare && i == prev_cpu)) {
-							cpumask_clear(&cm[MAX_SPARE_CAP]);
-							cpumask_set_cpu(i, &cm[MAX_SPARE_CAP]);
-						}
-					}
-				}
-			} else { /* Below path is for non-prefer idle case */
-				if (spare_cap > target_max_spare_cap) {
-					target_max_spare_cap = spare_cap;
-					most_spare_cap_cpu = i;
-				} else if (spare_cap == target_max_spare_cap) {
-					/*
-					 * Pick the CPU with least amount of
-					 * running tasks first.
-					 */
-					if (rq_nr_running < max_spare_cap_nr_running) {
-						max_spare_cap_nr_running = rq_nr_running;
-						most_spare_cap_cpu = i;
-					} else if (rq_nr_running == max_spare_cap_nr_running) {
+                        if (cap_i > cap_spare ||
+                            (cap_i == cap_spare && i == prev_cpu)) {
+                            cpumask_clear(&cm[MAX_SPARE_CAP]);
+                            cpumask_set_cpu(i, &cm[MAX_SPARE_CAP]);
+                        }
+                    }
+                }
+            } else { /* Below path is for non-prefer idle case */
+                if (spare_cap > target_max_spare_cap) {
+                    target_max_spare_cap = spare_cap;
+                    most_spare_cap_cpu = i;
+                } else if (spare_cap == target_max_spare_cap) {
+                    /*
+                     * Pick the CPU with least amount of
+                     * running tasks first.
+                     */
+                    if (rq_nr_running < max_spare_cap_nr_running) {
+                        max_spare_cap_nr_running = rq_nr_running;
+                        most_spare_cap_cpu = i;
+                    } else if (rq_nr_running == max_spare_cap_nr_running) {
 
-						unsigned long cap_i, cap_spare;
+                        unsigned long cap_i, cap_spare;
 
-						cap_i = capacity_of(i);
-						cap_spare = capacity_of(most_spare_cap_cpu);
+                        cap_i = capacity_of(i);
+                        cap_spare = capacity_of(most_spare_cap_cpu);
 
-						if (cap_i > cap_spare ||
-						    (cap_i == cap_spare && i == prev_cpu))
-							most_spare_cap_cpu = i;
-					}
-				}
+                        if (cap_i > cap_spare ||
+                            (cap_i == cap_spare && i == prev_cpu))
+                            most_spare_cap_cpu = i;
+                    }
+                }
 
 #if IS_ENABLED(CONFIG_USE_GROUP_THROTTLE)
-				if (group_overutilize || !util_fits)
-					continue;
+                if (group_overutilize || !util_fits)
+                    continue;
 #else
-				if (!util_fits)
-					continue;
+                if (!util_fits)
+                    continue;
 #endif
 
-				if (!task_fits)
-					continue;
+                if (!task_fits)
+                    continue;
 
-				if (!static_branch_likely(&enable_ptick)) {
+                if (!static_branch_likely(&enable_ptick)) {
 #if IS_ENABLED(CONFIG_USE_GROUP_THROTTLE)
-					if (spare_cap < min_t(unsigned long, task_util_capped,
-					    cap_scale(get_task_group_throttle(p),
-						      arch_scale_cpu_capacity(i))))
-						continue;
+                    if (spare_cap < min_t(unsigned long, task_util_capped,
+                        cap_scale(get_task_group_throttle(p),
+                            arch_scale_cpu_capacity(i))))
+                        continue;
 #else
-					if (spare_cap < task_util_capped)
-						continue;
+                    if (spare_cap < task_util_capped)
+                        continue;
 #endif
-				} else if (!spare_cap) {
-					continue;
-				}
+                } else if (!spare_cap) {
+                    continue;
+                }
 
-				/*
-				 * Find the best packing CPU with the maximum spare capacity in
-				 * the performance domain
-				 */
-				if (vendor_sched_npi_packing && !is_idle &&
-				    cpu_importance <= DEFAULT_IMPRATANCE_THRESHOLD &&
-				    spare_cap > pd_max_packing_spare_cap && capacity_curr_of(i) >=
-				    ((next_util + cpu_util_rt(cpu_rq(i))) *
-				    sched_capacity_margin[i]) >> SCHED_CAPACITY_SHIFT) {
-					pd_max_packing_spare_cap = spare_cap;
-					pd_best_packing_cpu = i;
-				}
+                /*
+                 * Find the best packing CPU with the maximum spare capacity in
+                 * the performance domain
+                 */
+                if (vendor_sched_npi_packing && !is_idle &&
+                    cpu_importance <= DEFAULT_IMPRATANCE_THRESHOLD &&
+                    spare_cap > pd_max_packing_spare_cap && capacity_curr_of(i) >=
+                    ((next_util + cpu_util_rt(cpu_rq(i))) *
+                    sched_capacity_margin[i]) >> SCHED_CAPACITY_SHIFT) {
+                    pd_max_packing_spare_cap = spare_cap;
+                    pd_best_packing_cpu = i;
+                }
 
-				if (pd_best_packing_cpu != -1)
-					continue;
+                if (pd_best_packing_cpu != -1)
+                    continue;
 
-				/*
-				 * Find the CPU with the maximum spare capacity in
-				 * the performance domain
-				 */
-				if (spare_cap > pd_max_spare_cap) {
-					pd_max_spare_cap = spare_cap;
-					pd_max_spare_cap_cpu = i;
-					pd_max_spare_cap_nr_running = rq_nr_running;
-					pd_best_exit_lat = exit_lat;
-				/* Candidates could be idle cpu, so compare their exit lat. */
-				} else if (spare_cap == pd_max_spare_cap) {
-					if (exit_lat < pd_best_exit_lat) {
-						pd_max_spare_cap_cpu = i;
-						pd_max_spare_cap_nr_running = rq_nr_running;
-						pd_best_exit_lat = exit_lat;
-					} else if (exit_lat == pd_best_exit_lat) {
-						if (rq_nr_running < pd_max_spare_cap_nr_running) {
-							pd_max_spare_cap_cpu = i;
-							pd_max_spare_cap_nr_running = rq_nr_running;
-						} else if (rq_nr_running == pd_max_spare_cap_nr_running) {
-							unsigned long cap_i, cap_spare;
+                /*
+                 * Find the CPU with the maximum spare capacity in
+                 * the performance domain
+                 */
+                if (spare_cap > pd_max_spare_cap) {
+                    pd_max_spare_cap = spare_cap;
+                    pd_max_spare_cap_cpu = i;
+                    pd_max_spare_cap_nr_running = rq_nr_running;
+                    pd_best_exit_lat = exit_lat;
+                /* Candidates could be idle cpu, so compare their exit lat. */
+                } else if (spare_cap == pd_max_spare_cap) {
+                    if (exit_lat < pd_best_exit_lat) {
+                        pd_max_spare_cap_cpu = i;
+                        pd_max_spare_cap_nr_running = rq_nr_running;
+                        pd_best_exit_lat = exit_lat;
+                    } else if (exit_lat == pd_best_exit_lat) {
+                        if (rq_nr_running < pd_max_spare_cap_nr_running) {
+                            pd_max_spare_cap_cpu = i;
+                            pd_max_spare_cap_nr_running = rq_nr_running;
+                        } else if (rq_nr_running == pd_max_spare_cap_nr_running) {
+                            unsigned long cap_i, cap_spare;
 
-							cap_i = capacity_of(i);
-							cap_spare = capacity_of(pd_max_spare_cap_cpu);
+                            cap_i = capacity_of(i);
+                            cap_spare = capacity_of(pd_max_spare_cap_cpu);
 
-							if (cap_i > cap_spare ||
-							    (cap_i == cap_spare && i == prev_cpu))
-								pd_max_spare_cap_cpu = i;
-						}
-					}
-				}
-			}
-		}
+                            if (cap_i > cap_spare ||
+                                (cap_i == cap_spare && i == prev_cpu))
+                                pd_max_spare_cap_cpu = i;
+                        }
+                    }
+                }
+            }
+        }
 
-		if (pd_max_spare_cap_running_rt_cpu != -1) {
-			cpumask_set_cpu(pd_max_spare_cap_running_rt_cpu, &cm[MAX_SPARE_CAP_RUNNING_RT]);
-		}
+        if (pd_max_spare_cap_running_rt_cpu != -1) {
+            cpumask_set_cpu(pd_max_spare_cap_running_rt_cpu, &cm[MAX_SPARE_CAP_RUNNING_RT]);
+        }
 
-		/* set the best_idle_cpu of each cluster */
-		if (pd_best_idle_cpu != -1) {
-			if (task_fits) {
-				cpumask_set_cpu(pd_best_idle_cpu, &cm[IDLE_FIT]);
-			} else {
-				cpumask_set_cpu(pd_best_idle_cpu, &cm[IDLE_UNFIT]);
-			}
-		}
+        /* set the best_idle_cpu of each cluster */
+        if (pd_best_idle_cpu != -1) {
+            if (task_fits) {
+                cpumask_set_cpu(pd_best_idle_cpu, &cm[IDLE_FIT]);
+            } else {
+                cpumask_set_cpu(pd_best_idle_cpu, &cm[IDLE_UNFIT]);
+            }
+        }
 
-		/* set the best_important_cpu of each cluster */
-		if (pd_most_unimportant_cpu != -1) {
-			if (task_fits) {
-				cpumask_set_cpu(pd_most_unimportant_cpu, &cm[UNIMPORTANT_FIT]);
-			} else {
-				cpumask_set_cpu(pd_most_unimportant_cpu, &cm[UNIMPORTANT_UNFIT]);
-			}
-		}
+        /* set the best_important_cpu of each cluster */
+        if (pd_most_unimportant_cpu != -1) {
+            if (task_fits) {
+                cpumask_set_cpu(pd_most_unimportant_cpu, &cm[UNIMPORTANT_FIT]);
+            } else {
+                cpumask_set_cpu(pd_most_unimportant_cpu, &cm[UNIMPORTANT_UNFIT]);
+            }
+        }
 
-		/* set the packing cpu of max_spare_cap of each cluster */
-		if (pd_best_packing_cpu != -1)
-			cpumask_set_cpu(pd_best_packing_cpu, &cm[PACKING]);
+        /* set the packing cpu of max_spare_cap of each cluster */
+        if (pd_best_packing_cpu != -1)
+            cpumask_set_cpu(pd_best_packing_cpu, &cm[PACKING]);
 
-		/* set the max_spare_cap_cpu of each cluster */
-		if (pd_max_spare_cap_cpu != -1)
-			cpumask_set_cpu(pd_max_spare_cap_cpu, &cm[MAX_SPARE_CAP]);
-	}
+        /* set the max_spare_cap_cpu of each cluster */
+        if (pd_max_spare_cap_cpu != -1)
+            cpumask_set_cpu(pd_max_spare_cap_cpu, &cm[MAX_SPARE_CAP]);
+    }
 
-	if (prefer_idle) {
-		preferred_idle_mask = get_preferred_idle_mask(p);
-		cpumask_or(&cm[IDLE_UNPREFERRED], &cm[IDLE_FIT], &cm[IDLE_UNFIT]);
-		cpumask_andnot(&cm[IDLE_UNPREFERRED], &cm[IDLE_UNPREFERRED], preferred_idle_mask);
-		// If there is no fit idle CPU in preferred_idle_mask, ignore it
-		if (task_fits_capacity(p, cpumask_last(preferred_idle_mask)))
-			cpumask_and(&cm[IDLE_FIT], &cm[IDLE_FIT], preferred_idle_mask);
-		cpumask_and(&cm[IDLE_UNFIT], &cm[IDLE_UNFIT], preferred_idle_mask);
-	}
+    if (prefer_idle) {
+        preferred_idle_mask = get_preferred_idle_mask(p);
+        cpumask_or(&cm[IDLE_UNPREFERRED], &cm[IDLE_FIT], &cm[IDLE_UNFIT]);
+        cpumask_andnot(&cm[IDLE_UNPREFERRED], &cm[IDLE_UNPREFERRED], preferred_idle_mask);
+        // If there is no fit idle CPU in preferred_idle_mask, ignore it
+        if (task_fits_capacity(p, cpumask_last(preferred_idle_mask)))
+            cpumask_and(&cm[IDLE_FIT], &cm[IDLE_FIT], preferred_idle_mask);
+        cpumask_and(&cm[IDLE_UNFIT], &cm[IDLE_UNFIT], preferred_idle_mask);
+    }
 
-	/* Assign candidates based on search order. */
-	if (prefer_fit) {
-		if (!cpumask_empty(&cm[IDLE_FIT])) {
-			cpumask_copy(&candidates, &cm[IDLE_FIT]);
-		} else if (!cpumask_empty(&cm[UNIMPORTANT_FIT])) {
-			cpumask_copy(&candidates, &cm[UNIMPORTANT_FIT]);
-		} else if (idle_max_cap_cpu != -1 && unimportant_max_spare_cap_cpu == -1) {
-			cpumask_set_cpu(idle_max_cap_cpu, &candidates);
-		} else if (idle_max_cap_cpu == -1 && unimportant_max_spare_cap_cpu != -1) {
-			cpumask_set_cpu(unimportant_max_spare_cap_cpu, &candidates);
-		} else if (idle_max_cap_cpu != -1 && unimportant_max_spare_cap_cpu != -1) {
-			if (idle_max_cap >= unimportant_max_spare_cap)
-				cpumask_set_cpu(idle_max_cap_cpu, &candidates);
-			else
-				cpumask_set_cpu(unimportant_max_spare_cap_cpu, &candidates);
-		} else if (!cpumask_empty(&cm[MAX_SPARE_CAP])) {
-			cpumask_copy(&candidates, &cm[MAX_SPARE_CAP]);
-		} else if (!cpumask_empty(&cm[MAX_SPARE_CAP_RUNNING_RT])){
-			cpumask_copy(&candidates, &cm[MAX_SPARE_CAP_RUNNING_RT]);
-		}
-	} else {
-		if (!cpumask_empty(&cm[IDLE_FIT])) {
-			cpumask_copy(&candidates, &cm[IDLE_FIT]);
-		} else if (!cpumask_empty(&cm[IDLE_UNFIT])) {
-			/* Assign biggest cpu core found for unfit case. */
-			cpumask_set_cpu(cpumask_last(&cm[IDLE_UNFIT]), &candidates);
-		} else if (!cpumask_empty(&cm[UNIMPORTANT_FIT])) {
-			cpumask_copy(&candidates, &cm[UNIMPORTANT_FIT]);
-		} else if (!cpumask_empty(&cm[UNIMPORTANT_UNFIT])) {
-			cpumask_set_cpu(cpumask_last(&cm[UNIMPORTANT_UNFIT]), &candidates);
-		} else if (!cpumask_empty(&cm[IDLE_UNPREFERRED])) {
-			cpumask_copy(&candidates, &cm[IDLE_UNPREFERRED]);
-		} else if (!cpumask_empty(&cm[PACKING])) {
-			cpumask_copy(&candidates, &cm[PACKING]);
-		} else if (!cpumask_empty(&cm[MAX_SPARE_CAP])) {
-			cpumask_copy(&candidates, &cm[MAX_SPARE_CAP]);
-		}
-	}
+    /* Assign candidates based on search order. */
+    if (prefer_fit) {
+        if (!cpumask_empty(&cm[IDLE_FIT])) {
+            cpumask_copy(&candidates, &cm[IDLE_FIT]);
+        } else if (!cpumask_empty(&cm[UNIMPORTANT_FIT])) {
+            cpumask_copy(&candidates, &cm[UNIMPORTANT_FIT]);
+        } else if (idle_max_cap_cpu != -1 && unimportant_max_spare_cap_cpu == -1) {
+            cpumask_set_cpu(idle_max_cap_cpu, &candidates);
+        } else if (idle_max_cap_cpu == -1 && unimportant_max_spare_cap_cpu != -1) {
+            cpumask_set_cpu(unimportant_max_spare_cap_cpu, &candidates);
+        } else if (idle_max_cap_cpu != -1 && unimportant_max_spare_cap_cpu != -1) {
+            if (idle_max_cap >= unimportant_max_spare_cap)
+                cpumask_set_cpu(idle_max_cap_cpu, &candidates);
+            else
+                cpumask_set_cpu(unimportant_max_spare_cap_cpu, &candidates);
+        } else if (!cpumask_empty(&cm[MAX_SPARE_CAP])) {
+            cpumask_copy(&candidates, &cm[MAX_SPARE_CAP]);
+        } else if (!cpumask_empty(&cm[MAX_SPARE_CAP_RUNNING_RT])){
+            cpumask_copy(&candidates, &cm[MAX_SPARE_CAP_RUNNING_RT]);
+        }
+    } else {
+        if (!cpumask_empty(&cm[IDLE_FIT])) {
+            cpumask_copy(&candidates, &cm[IDLE_FIT]);
+        } else if (!cpumask_empty(&cm[IDLE_UNFIT])) {
+            /* Assign biggest cpu core found for unfit case. */
+            cpumask_set_cpu(cpumask_last(&cm[IDLE_UNFIT]), &candidates);
+        } else if (!cpumask_empty(&cm[UNIMPORTANT_FIT])) {
+            cpumask_copy(&candidates, &cm[UNIMPORTANT_FIT]);
+        } else if (!cpumask_empty(&cm[UNIMPORTANT_UNFIT])) {
+            cpumask_set_cpu(cpumask_last(&cm[UNIMPORTANT_UNFIT]), &candidates);
+        } else if (!cpumask_empty(&cm[IDLE_UNPREFERRED])) {
+            cpumask_copy(&candidates, &cm[IDLE_UNPREFERRED]);
+        } else if (!cpumask_empty(&cm[PACKING])) {
+            cpumask_copy(&candidates, &cm[PACKING]);
+        } else if (!cpumask_empty(&cm[MAX_SPARE_CAP])) {
+            cpumask_copy(&candidates, &cm[MAX_SPARE_CAP]);
+        }
+    }
 
-	cpumask_andnot(&candidates_temp, &candidates, get_group_cfs_skip_mask(p));
-	if (!cpumask_empty(&candidates_temp))
-		cpumask_copy(&candidates, &candidates_temp);
+    cpumask_andnot(&candidates_temp, &candidates, get_group_cfs_skip_mask(p));
+    if (!cpumask_empty(&candidates_temp))
+        cpumask_copy(&candidates, &candidates_temp);
 
-	weight = cpumask_weight(&candidates);
-	best_energy_cpu = most_spare_cap_cpu != -1 ? most_spare_cap_cpu: least_loaded_cpu;
+    weight = cpumask_weight(&candidates);
+    best_energy_cpu = most_spare_cap_cpu != -1 ? most_spare_cap_cpu: least_loaded_cpu;
 
-	/* Bail out if no candidate was found. */
-	if (weight == 0)
-		goto out;
+    /* Bail out if no candidate was found. */
+    if (weight == 0)
+        goto out;
 
-	/* Bail out if only 1 candidate was found. */
-	if (weight == 1) {
-		best_energy_cpu = cpumask_first(&candidates);
-		goto out;
-	}
+    /* Bail out if only 1 candidate was found. */
+    if (weight == 1) {
+        best_energy_cpu = cpumask_first(&candidates);
+        goto out;
+    }
 
-	/* Compute Energy */
-	pd = rcu_dereference(rd->pd);
-	for_each_cpu(i, &candidates) {
-		unsigned int rq_nr_running = cpu_rq(i)->nr_running;
+    /* Compute Energy */
+    pd = rcu_dereference(rd->pd);
+    for_each_cpu(i, &candidates) {
+        unsigned int rq_nr_running = cpu_rq(i)->nr_running;
 
-		if (task_current(cpu_rq(i), p) || (task_on_rq_queued(p) && i == prev_cpu))
-			rq_nr_running--;
+        if (task_current(cpu_rq(i), p) || (task_on_rq_queued(p) && i == prev_cpu))
+            rq_nr_running--;
 
-		exit_lat = 1;
-		if (cpu_is_idle(i)) {
-			idle_state = idle_get_state(cpu_rq(i));
-			if (idle_state)
-				exit_lat = idle_state->exit_latency;
-		}
+        exit_lat = 1;
+        if (cpu_is_idle(i)) {
+            idle_state = idle_get_state(cpu_rq(i));
+            if (idle_state)
+                exit_lat = idle_state->exit_latency;
+        }
 
-		cur_energy = compute_energy(p, i, pd, exit_lat);
+        cur_energy = compute_energy(p, i, pd, exit_lat);
 
-		if (cur_energy < best_energy) {
-			best_energy = cur_energy;
-			best_energy_cpu = i;
-			best_exit_lat = exit_lat;
-			best_nr_running = rq_nr_running;
-		} else if (cur_energy == best_energy) {
-			if (exit_lat < best_exit_lat) {
-				best_energy_cpu = i;
-				best_exit_lat = exit_lat;
-				best_nr_running = rq_nr_running;
-			} else if (exit_lat == best_exit_lat) {
-				if (rq_nr_running < best_nr_running) {
-					best_energy_cpu = i;
-					best_nr_running = rq_nr_running;
-				} else if (rq_nr_running == best_nr_running) {
-					/* Pick the higher capacity cpu. */
-					best_energy_cpu = i;
-				}
-			}
-		}
-	}
+        if (cur_energy < best_energy) {
+            best_energy = cur_energy;
+            best_energy_cpu = i;
+            best_exit_lat = exit_lat;
+            best_nr_running = rq_nr_running;
+        } else if (cur_energy == best_energy) {
+            if (exit_lat < best_exit_lat) {
+                best_energy_cpu = i;
+                best_exit_lat = exit_lat;
+                best_nr_running = rq_nr_running;
+            } else if (exit_lat == best_exit_lat) {
+                if (rq_nr_running < best_nr_running) {
+                    best_energy_cpu = i;
+                    best_nr_running = rq_nr_running;
+                } else if (rq_nr_running == best_nr_running) {
+                    /* Pick the higher capacity cpu. */
+                    best_energy_cpu = i;
+                }
+            }
+        }
+    }
 
 out:
-	rcu_read_unlock();
-	trace_sched_find_energy_efficient_cpu(p, prefer_idle, prefer_fit,
-					 task_importance, cm, best_energy_cpu);
+    rcu_read_unlock();
+    trace_sched_find_energy_efficient_cpu(p, prefer_idle, prefer_fit,
+                     task_importance, cm, best_energy_cpu);
 
-	return best_energy_cpu;
+    return best_energy_cpu;
 }
-
 #define IOWAIT_BOOST_MIN	(SCHED_CAPACITY_SCALE / 8)
 
 void rvh_set_iowait_pixel_mod(void *data, struct task_struct *p, struct rq *rq,
