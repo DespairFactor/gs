@@ -2966,7 +2966,7 @@ void rvh_select_task_rq_fair_pixel_mod(void *data, struct task_struct *p, int pr
     }
 
 out:
-    if (trace_sched_select_task_rq_fair_enabled())
+    if (trace_sched_select_task_rq_fair_enabled()) {
         trace_sched_select_task_rq_fair(p, task_util_est(p),
                         sync_wakeup, get_adpf(p, true), prefer_prev,
                         get_prefer_high_cap(p),
@@ -2974,13 +2974,11 @@ out:
                         uclamp_eff_value_pixel_mod(p, UCLAMP_MIN),
                         uclamp_eff_value_pixel_mod(p, UCLAMP_MAX),
                         prev_cpu, *target_cpu);
+    }
 
-						uclamp_eff_value_pixel_mod(p, UCLAMP_MAX),
-						prev_cpu, *target_cpu);
+    _reset_prefer_high_cap(p);
+}
 
-	_reset_prefer_high_cap(p);
-}
-}
 void rvh_set_user_nice_locked_pixel_mod(void *data, struct task_struct *p, long *nice,
 					bool *allowed)
 {
