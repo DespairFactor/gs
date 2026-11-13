@@ -1265,45 +1265,52 @@ static void sugov_update_single(struct update_util_data *hook, u64 time,
 
 static unsigned int sugov_next_freq_shared(struct sugov_cpu *sg_cpu, u64 time)
 {
-	struct sugov_policy *sg_policy = sg_cpu->sg_policy;
-	struct cpufreq_policy *policy = sg_policy->policy;
-	unsigned long util = 0, max = 1;
-	unsigned int j, dominant_cpu;
+    struct sugov_policy *sg_policy = sg_cpu->sg_policy;
+    struct cpufreq_policy *policy = sg_policy->policy;
+    unsigned long util = 0, max = 1;
+    unsigned int j, dominant_cpu;
 
-	/* Ensure system state is valid before using affinity caching */
-	dominant_cpu = (likely(system_state >= SYSTEM_RUNNING)) ? sg_policy->last_max_cpu : cpumask_first(policy->cpus);
+    dominant_cpu = (likely(system_state >= SYSTEM_RUNNING)) ? sg_policy->last_max_cpu : cpumask_first(policy->cpus);
 
-	/* Evaluate the historically dominant CPU first */
-	if (cpumask_test_cpu(dominant_cpu, policy->cpus)) {
-		struct sugov_cpu *dom_sg_cpu = &per_cpu(sugov_cpu, dominant_cpu);
-		sugov_get_util(dom_sg_cpu);
-		sugov_iowait_apply(dom_sg_cpu, time);
-		util = dom_sg_cpu->util;
-		max = dom_sg_cpu->max;
-		sg_policy->last_max_cpu = dominant_cpu;
-	}
+    /* Evaluate the historically dominant CPU first */
+    if (cpumask_test_cpu(dominant_cpu, policy->cpus)) {
+        struct sugov_cpu *dom_sg_cpu = &per_cpu(sugov_cpu, dominant_cpu);
+        sugov_get_util(dom_sg_cpu);
+        sugov_iowait_apply(dom_sg_cpu, time);
+        util = dom_sg_cpu->util;
+        max = dom_sg_cpu->max;
+        sg_policy->last_max_cpu = dominant_cpu;
+    }
 
-	/* Scan remaining CPUs in the cluster mask */
-	for_each_cpu(j, policy->cpus) {
-		struct sugov_cpu *j_sg_cpu = &per_cpu(sugov_cpu, j);
-		unsigned long j_util, j_max;
+    /* 
+     * OPTIMIZATION: Short-circuit cluster scan if dominant CPU load saturates capacity 
+     * or is sufficiently high with no competing task bursts on companion cores.
+     */
+    if (likely(util > (max - (max >> 3)))) {
+        return get_next_freq(sg_policy, util, max);
+    }
 
-		if (j == dominant_cpu)
-			continue;
+    /* Scan remaining CPUs in the cluster mask */
+    for_each_cpu(j, policy->cpus) {
+        struct sugov_cpu *j_sg_cpu = &per_cpu(sugov_cpu, j);
+        unsigned long j_util, j_max;
 
-		sugov_get_util(j_sg_cpu);
-		sugov_iowait_apply(j_sg_cpu, time);
-		j_util = j_sg_cpu->util;
-		j_max = j_sg_cpu->max;
+        if (j == dominant_cpu)
+            continue;
 
-		if (j_util * max > j_max * util) {
-			util = j_util;
-			max = j_max;
-			sg_policy->last_max_cpu = j;
-		}
-	}
+        sugov_get_util(j_sg_cpu);
+        sugov_iowait_apply(j_sg_cpu, time);
+        j_util = j_sg_cpu->util;
+        j_max = j_sg_cpu->max;
 
-	return get_next_freq(sg_policy, util, max);
+        if (j_util * max > j_max * util) {
+            util = j_util;
+            max = j_max;
+            sg_policy->last_max_cpu = j;
+        }
+    }
+
+    return get_next_freq(sg_policy, util, max);
 }
 
 static void update_avg_real_cap_cluster(struct cpufreq_policy *policy)
