@@ -1044,6 +1044,18 @@ static void sugov_iowait_boost(struct sugov_cpu *sg_cpu, u64 time,
 		return;
 	sg_cpu->iowait_boost_pending = true;
 
+	/* 
+	 * OPTIMIZATION: Adaptive Saturated Load I/O Boost Damping
+	 * If the CPU's current utilization is already high (> 75% capacity), 
+	 * suppress exponential I/O boost doubling to prevent thermal runaway 
+	 * and power spikes during heavy storage activity.
+	 */
+	if (likely(system_state >= SYSTEM_RUNNING) && 
+	    (sg_cpu->util > (sg_cpu->max - (sg_cpu->max >> 2)))) {
+		sg_cpu->iowait_boost = IOWAIT_BOOST_MIN;
+		return;
+	}
+
 	/* Double the boost at each request */
 	if (sg_cpu->iowait_boost) {
 		sg_cpu->iowait_boost =
@@ -1052,10 +1064,9 @@ static void sugov_iowait_boost(struct sugov_cpu *sg_cpu, u64 time,
 		return;
 	}
 
-/* 
-	 * OPTIMIZATION: Background vs Foreground I/O Boost Damping
-	 * If the current task is a background thread or kworker, severely dampen 
-	 * the I/O boost floor to prevent background I/O from pinning frequencies.
+	/* 
+	 * Background vs Foreground I/O Boost Damping (Existing Optimization)
+	 * Dampen the I/O boost floor for background threads, kthreads, or low-util tasks.
 	 */
 	if (likely(system_state >= SYSTEM_RUNNING)) {
 		struct task_struct *curr = cpu_rq(sg_cpu->cpu)->curr;
