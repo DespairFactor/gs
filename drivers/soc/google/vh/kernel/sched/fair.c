@@ -2596,10 +2596,16 @@ void rvh_check_preempt_wakeup_fair_pixel_mod(void *data, struct rq *rq, struct t
 	if (!entity_is_task(se) || !entity_is_task(pse))
 		return;
 
-	/*
-	 * With NEXT_BUDDY enabled, pse could have been set next buddy already,
-	 * so clear it first to keep behavior sync.
+	/* 
+	 * OPTIMIZATION: Transient Task Preemption Filter
+	 * If the waking task has a very small estimated utilization, skip 
+	 * aggressive buddy promotion and forced preemption to prevent 
+	 * unnecessary context-switch overhead and cache thrashing on big cores.
 	 */
+	if (task_util_est(task_of(pse)) < (SCHED_CAPACITY_SCALE / 32)) {
+		return;
+	}
+
 	clear_buddies(cfs_rq_of(pse), pse);
 
 	if (((!get_preempt_wakeup(task_of(se)) && get_preempt_wakeup(task_of(pse))) ||
