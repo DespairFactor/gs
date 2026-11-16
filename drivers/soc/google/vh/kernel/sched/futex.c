@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* core.c
+/* core.c (futex.c)
  *
  * Android Vendor Hook Support
  *
@@ -22,7 +22,12 @@ void vh_alter_futex_plist_add_pixel_mod(void *data, struct plist_node *q_list,
 	struct plist_node *current_node = q_list;
 	struct plist_node *this_node;
 
-	if (!get_adpf(current, true)) {
+	/* 
+	 * OPTIMIZATION: Early Exit Guard
+	 * If the hash chain is empty or the current task is not ADPF-boosted, 
+	 * bypass traversal entirely to reduce lock contention overhead.
+	 */
+	if (plist_head_empty(hb_chain) || !get_adpf(current, true)) {
 		*already_on_hb = false;
 		return;
 	}
