@@ -70,13 +70,24 @@ void rvh_sched_setaffinity_mod(void *data, struct task_struct *task,
 	block_affinity |= vg[group].disable_sched_setaffinity;
 
 	if (block_affinity) {
+		/* 
+		 * OPTIMIZATION: Affinity Equality Guard
+		 * If the task's current allowed mask is already equal to the requested 
+		 * mask, skip the reset and permission error overhead.
+		 */
+		if (in_mask && cpumask_equal(task->cpus_ptr, in_mask))
+			return;
+
 		__reset_task_affinity(task, NULL);
 		*res = -EPERM;
 		return;
 	}
 
-	if (vg[group].disable_sched_setaffinity_mask)
+	if (vg[group].disable_sched_setaffinity_mask) {
+		if (in_mask && cpumask_equal(task->cpus_ptr, in_mask))
+			return;
 		__reset_task_affinity(task, in_mask);
+	}
 }
 
 /*
